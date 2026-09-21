@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local trader configuration and runtime state
+.env.*
+!.env.example
+*.sqlite3
+*.db
+data/
+logs/
+.vscode/
