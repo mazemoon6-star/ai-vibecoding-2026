@@ -47,6 +47,7 @@ class TickRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     symbol: str = Field(min_length=1, max_length=32)
+    name: str | None = Field(default=None, max_length=128)
     price: Decimal = Field(gt=0)
     bid: Decimal | None = Field(default=None, gt=0)
     ask: Decimal | None = Field(default=None, gt=0)
@@ -61,11 +62,39 @@ class TickRequest(BaseModel):
             raise ValueError("symbol must not be blank")
         return value
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
     @model_validator(mode="after")
     def validate_book(self) -> "TickRequest":
         if self.bid is not None and self.ask is not None and self.bid > self.ask:
             raise ValueError("bid must be less than or equal to ask")
         return self
+
+
+class MarketSyncRequest(BaseModel):
+    """Symbols to fetch from the read-only Toss market-data adapter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[str] = Field(min_length=1, max_length=200)
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_symbols(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            symbol = value.strip().upper()
+            if symbol and symbol not in normalized:
+                normalized.append(symbol)
+        if not normalized:
+            raise ValueError("symbols must not be empty")
+        return normalized
 
 
 class OrderRequest(BaseModel):
@@ -94,6 +123,57 @@ class OrderRequest(BaseModel):
         if self.order_type is OrderType.MARKET and self.price is not None:
             raise ValueError("price is not allowed for MARKET orders")
         return self
+
+
+class AutoStrategySettings(BaseModel):
+    """Moving-average settings for one auto-trade symbol."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    short_window: int = Field(default=3, ge=2, le=200)
+    long_window: int = Field(default=8, ge=3, le=500)
+    order_quantity: Decimal = Field(default=Decimal("1"), gt=0)
+
+    @model_validator(mode="after")
+    def validate_windows(self) -> "AutoStrategySettings":
+        if self.short_window >= self.long_window:
+            raise ValueError("short_window must be less than long_window")
+        return self
+
+
+class AutoStrategyResumeRequest(BaseModel):
+    """Per-symbol moving-average settings submitted when resuming trading."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    settings: dict[str, AutoStrategySettings] = Field(default_factory=dict)
+
+    @field_validator("settings")
+    @classmethod
+    def normalize_settings_symbols(cls, values: dict[str, AutoStrategySettings]) -> dict[str, AutoStrategySettings]:
+        normalized: dict[str, AutoStrategySettings] = {}
+        for symbol, settings in values.items():
+            key = symbol.strip().upper()
+            if not key:
+                raise ValueError("settings symbol must not be blank")
+            if key in normalized:
+                raise ValueError(f"duplicate settings for symbol: {key}")
+            normalized[key] = settings
+        return normalized
+
+
+class AutoStrategySymbolRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1, max_length=32)
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        value = value.strip().upper()
+        if not value:
+            raise ValueError("symbol must not be blank")
+        return value
 
 
 class StrategyRequest(BaseModel):

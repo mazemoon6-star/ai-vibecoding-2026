@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>토스 증권자동매매 · PAPER dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css?v=9" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <div class="brand-row"><span class="brand-mark" aria-hidden="true">↗</span><span class="brand-name">Automatic Trader</span><span class="mode-pill">PAPER</span></div>
+        <h1>토스 증권자동매매</h1>
+        <p class="subtitle">토스 시세를 읽어 가상계좌에서 전략을 검증하는 운영 화면</p>
+      </div>
+      <div class="top-meta">
+        <div class="top-actions">
+          <span id="broker-badge" class="badge muted">연결 상태 확인 중</span>
+          <a class="docs-link" href="/docs" target="_blank" rel="noreferrer">API 문서 <span aria-hidden="true">↗</span></a>
+        </div>
+        <time id="last-refreshed" class="last-refreshed">갱신 대기 중</time>
+      </div>
+    </header>
+
+    <main class="page">
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <div class="account-overview">
+        <section class="kpi-grid" aria-label="계좌 요약">
+          <article class="card kpi"><span>모드</span><strong id="mode">PAPER</strong><small id="trading-status">확인 중</small></article>
+          <article class="card kpi"><span>가용 현금</span><strong id="available-cash">-</strong><small>예약 금액 제외</small></article>
+          <article class="card kpi"><span>총 평가금액</span><strong id="equity">-</strong><small id="as-of">-</small></article>
+          <article class="card kpi"><span>실현 손익</span><dl class="pnl-comparison"><div><dt>수수료 반영</dt><dd id="realized-pnl">-</dd></div><div><dt>수수료 미반영</dt><dd id="realized-pnl-before-fees">-</dd></div></dl><small>매도 체결분의 매수·매도 수수료 기준</small></article>
+        </section>
+
+        <section id="investment-card" class="card investment-card" aria-labelledby="investment-heading">
+          <div class="section-heading"><div><p class="eyebrow">PORTFOLIO</p><h2 id="investment-heading">투자 현황</h2></div><span class="pill">보유 종목 기준</span></div>
+          <div class="investment-stage">
+            <div class="investment-donut">
+              <svg class="investment-svg" viewBox="0 0 400 400" role="group" aria-label="보유 종목 투자금액 원형차트">
+                <circle class="investment-track" cx="200" cy="200" r="132" fill="none" stroke-width="56" />
+                <g class="investment-segments"></g>
+              </svg>
+              <div class="investment-center"><span>총 투자금액</span><strong id="investment-total">-</strong><small id="investment-count">불러오는 중</small></div>
+            </div>
+            <div id="investment-tooltip" class="investment-tooltip" role="tooltip" hidden>
+              <div class="investment-tooltip-title"><span class="investment-dot" aria-hidden="true"></span><strong data-investment-name></strong><small data-investment-symbol-label></small></div>
+              <dl><div><dt>투자금액</dt><dd data-investment-cost></dd></div><div><dt>평균매수가</dt><dd data-investment-average></dd></div><div><dt>평가손익</dt><dd data-investment-pnl></dd></div></dl>
+              <p data-investment-quantity></p>
+            </div>
+          </div>
+          <p id="investment-help" class="investment-help">보유 종목을 불러오는 중입니다.</p>
+        </section>
+      </div>
+
+      <section class="card controls">
+        <div class="section-heading"><div><p class="eyebrow">OPERATIONS</p><h2>운영 제어</h2></div><span class="hint">주문은 현재 PAPER 엔진에서만 처리됩니다.</span></div>
+        <div class="button-row">
+          <button data-control="resume" class="button primary">거래 재개</button>
+          <button data-control="pause" class="button warning">일시 정지</button>
+          <button data-control="kill-switch" class="button danger">긴급 중지</button>
+          <button id="refresh" class="button ghost">새로고침</button>
+        </div>
+      </section>
+
+      <section class="card volume-search-card">
+        <div class="section-heading"><div><p class="eyebrow">STOCK SEARCH</p><h2>&#xC885;&#xBAA9; &#xAC80;&#xC0C9;</h2></div><span id="volume-ranked-at" class="pill">&#xAC80;&#xC0C9; &#xC804;</span></div>
+        <p class="form-help volume-search-help">회사 공개 사업·제품 자료를 앱 내부 종목 프로필과 대조해 검색합니다. 관련 산업은 공식 업종분류가 아닌 참고용 분류이며, 종목별 출처 링크에서 근거를 확인하세요. 예: 냉각, 애플, KB금융, AAPL, 105560</p>
+        <form id="volume-search-form" class="volume-search-form">
+          <label>&#xC0B0;&#xC5C5; &#xD0A4;&#xC6CC;&#xB4DC; / &#xC885;&#xBAA9;&#xBA85; / &#xCF54;&#xB4DC;<input id="volume-keyword" placeholder="&#xC608;: &#xB0C9;&#xAC01;, &#xC560;&#xD50C;, KB&#xAE08;&#xC735;, AAPL, 105560" required /></label>
+          <label>&#xC2DC;&#xC7A5;<select id="volume-market"><option value="KR">&#xAD6D;&#xB0B4; &#xC8FC;&#xC2DD;</option><option value="US">&#xBBF8;&#xAD6D; &#xC8FC;&#xC2DD;</option></select></label>
+          <button class="button primary" type="submit">&#xAC80;&#xC0C9;</button>
+        </form>
+        <div class="table-wrap"><table class="related-table"><thead><tr><th>&#xC885;&#xBAA9;&#xBA85;</th><th>&#xC885;&#xBAA9;&#xCF54;&#xB4DC;</th><th>&#xD604;&#xC7AC;&#xAC00;</th><th>&#xAD00;&#xB828;&#xB3C4;</th><th>&#xAD00;&#xB828; &#xC0B0;&#xC5C5; / &#xD14C;&#xB9C8;</th><th>&#xAD00;&#xB828; &#xC774;&#xC720;</th><th></th></tr></thead><tbody id="volume-results"><tr><td colspan="7" class="empty">&#xC0B0;&#xC5C5; &#xD0A4;&#xC6CC;&#xB4DC;&#xB97C; &#xC785;&#xB825;&#xD574; &#xAC80;&#xC0C9;&#xD558;&#xC138;&#xC694;.</td></tr></tbody></table></div>
+      </section>
+
+      <div class="two-column">
+        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">AUTO TRADE · PAPER</p><h2>자동매매 종목</h2></div><span class="pill">종목 선택 후 거래 재개</span></div><p class="form-help auto-trade-help">종목별 단기 창, 장기 창, 주문 수량을 입력한 뒤 거래 재개를 누르세요. 설정은 각 종목에만 적용됩니다.</p><div class="table-wrap auto-trade-wrap"><table class="auto-trade-symbols-table"><thead><tr><th>심볼</th><th>종목명</th><th>상태</th><th>단기 창</th><th>장기 창</th><th>주문 수량</th><th></th></tr></thead><tbody id="auto-trade-symbols-body"></tbody></table></div></section>
+        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">MOVING AVERAGE</p><h2>이동평균 전략</h2></div></div><p class="form-help strategy-settings-help">종목별 설정의 단기 평균선이 장기 평균선을 상향 교차하면 매수하고, 하향 교차하면 매도합니다. 창은 시세 데이터 개수입니다.</p><div class="section-heading registered-strategies-heading"><div><p class="eyebrow">STRATEGIES</p><h3>실행 중 전략</h3></div></div><div class="table-wrap"><table><thead><tr><th>이름</th><th>심볼</th><th>창</th><th>활성</th></tr></thead><tbody id="strategies-body"></tbody></table></div></section>
+      </div>
+
+      <div class="two-column single-column">
+        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">PORTFOLIO</p><h2>보유 포지션</h2></div><span class="pill">토스 시세 조회 기준 · 약 15초 주기</span></div><div class="table-wrap"><table><thead><tr><th>심볼</th><th>종목명</th><th>수량</th><th>평균가</th><th>현재가</th><th>평가손익</th></tr></thead><tbody id="positions-body"></tbody></table></div></section>
+      </div>
+    </main>
+    <footer>Automatic Trader v0.2 · 실계좌 주문 API는 비활성화되어 있습니다.</footer>
+    <script src="/static/investment_chart.js?v=1"></script>
+    <script src="/static/app.js?v=12"></script>
+  </body>
+</html>

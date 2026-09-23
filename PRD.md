@@ -189,3 +189,11 @@ flowchart LR
 - [토스증권 Open API 문서](https://developers.tossinvest.com/docs)
 - [REST OpenAPI 원본](https://openapi.tossinvest.com/openapi-docs/latest/openapi.json)
 - [WebSocket AsyncAPI 원본](https://openapi.tossinvest.com/openapi-docs/latest/asyncapi.json)
+
+## 13. 2단계 구현 현황 (v0.2)
+
+- `/dashboard` 운영 화면에서 가상계좌, 포지션, 주문, 전략, 최근 시세를 확인한다.
+- 이동평균 전략을 여러 개 등록하고 PAPER 엔진에서 실행한다.
+- `POST /api/v1/market/sync`가 토스 `GET /api/v1/prices`를 읽기 전용으로 호출해 PAPER 틱으로 반영한다.
+- 토큰과 API 오류를 공통 오류 응답으로 변환하고, 토스 주문 API는 호출하지 않는다.
+- 다음 작업은 WebSocket 시세 스트림, 조건주문(SINGLE/OCO/OTO), 알림과 백테스트다.

@@ -1,5 +1,18 @@
 # AI-vibecoding-2026
 
+### Automatic Trader phase 2
+
+```powershell
+python -m pip install -r requirements.txt
+python -m auto_trader
+```
+
+- Dashboard: `http://127.0.0.1:8000/dashboard`
+- API docs: `http://127.0.0.1:8000/docs`
+- Toss market data is read-only in phase 2 and is fed into the PAPER engine.
+- Live order APIs remain disabled.
+- Korean user guide: [사용자_설명서.md](사용자_설명서.md)
+
 바이브코딩 리포지토리
 
 
@@ -73,4 +86,21 @@ AI에게 코딩을 시키자, 제대로!
 
 - Client ID, Client Secert 복사
 - cmd > ipconfig로 아이피 확인 후 추가
-- 
+
+
+#### 주식 자동매매 파이썬 프로그램 분석
+
+- `__init__.py` : 일반적으로 파일만 생성. 소스코드 없음 프로젝트 폴더가 pip 처럼 설치할 수 있는 패키지화 
+- `__main__.py` : 파이썬으로 실행될때 가장 먼저 실행되는 메인 함수 파일
+- `__pycache__` : 미리 만들어놓은 파이썬 실행 파일(캐시/임시데이터)
+- `tests`       : 소스코드 테스트 실행을 위한 폴더
+- `.env.example` : 환경설정 예제파일  .example을 지우고 사용
+    .env 는 깃허브에 업로드 방지위해 .gitignore에 제외파일로 등록(클라이언트 아이디 등 보완)
+- requirements.txt : 파이썬 개발환경 패키지 설치리스트 파일
+    - `pip install -r requirements.txt` 로 전부 설치
+
+
+#### HTTP 403문제
+
+
+- 공인아이피 사이트에서 확인

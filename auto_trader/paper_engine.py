@@ -11,13 +11,18 @@ import asyncio
 import hashlib
 import json
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import uuid4
 
+from .instruments import instrument_name
+from .paper_state import PaperStateStore, StateStoreError, dump_engine, restore_engine
 from .models import (
+    AutoStrategySettings,
+    AutoStrategySymbolRequest,
     ExecutionMode,
     OrderRequest,
     OrderSide,
@@ -44,6 +49,7 @@ class EngineError(Exception):
 @dataclass
 class Tick:
     symbol: str
+    name: str
     price: Decimal
     bid: Decimal | None
     ask: Decimal | None
@@ -58,6 +64,7 @@ class Position:
     quantity: Decimal = Decimal("0")
     average_price: Decimal = Decimal("0")
     realized_pnl: Decimal = Decimal("0")
+    remaining_buy_fees: Decimal = Decimal("0")
 
 
 @dataclass
@@ -122,6 +129,9 @@ class PaperEngine:
         self.created_at = utc_now()
 
         self.ticks: dict[str, Tick] = {}
+        self.tick_history: dict[str, deque[Tick]] = defaultdict(
+            lambda: deque(maxlen=self.history_size)
+        )
         self.price_history: dict[str, deque[Decimal]] = defaultdict(
             lambda: deque(maxlen=self.history_size)
         )
@@ -129,16 +139,58 @@ class PaperEngine:
         self.orders: dict[str, PaperOrder] = {}
         self.client_orders: dict[str, str] = {}
         self.strategies: dict[str, Strategy] = {}
+        self.auto_watchlist: dict[str, datetime] = {}
+        self.auto_strategy_ids: dict[str, str] = {}
+        self.auto_strategy_settings: dict[str, AutoStrategySettings] = {}
         self.reserved_cash = Decimal("0")
         self.reserved_sell_quantity: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
         self.realized_pnl = Decimal("0")
+        self.realized_pnl_before_fees = Decimal("0")
         self.metrics: dict[str, int] = defaultdict(int)
         self.lock = asyncio.Lock()
+        self.state_store: PaperStateStore | None = None
+
+    def enable_persistence(self, path) -> None:
+        """Load before starting workers; never silently discard an unreadable account."""
+        if self.state_store is not None:
+            raise RuntimeError("Persistence is already enabled")
+        store = PaperStateStore(path)
+        try:
+            snapshot = store.load()
+            if snapshot is None:
+                store.save(dump_engine(self))
+            else:
+                restore_engine(self, snapshot)
+            self.state_store = store
+        except BaseException:
+            store.close()
+            raise
+
+    @asynccontextmanager
+    async def _mutation(self):
+        async with self.lock:
+            before = dump_engine(self) if self.state_store is not None else None
+            try:
+                yield
+                if self.state_store is not None:
+                    self.state_store.save(dump_engine(self))
+            except BaseException as exc:
+                if before is not None:
+                    restore_engine(self, before)
+                if isinstance(exc, StateStoreError):
+                    raise EngineError("state_storage_error", "가상계좌 저장에 실패해 변경을 취소했습니다. 저장 공간을 확인하세요.", 503) from exc
+                raise
+
+    def close_persistence(self) -> None:
+        if self.state_store is not None:
+            self.state_store.close()
+            self.state_store = None
 
     async def update_tick(self, request: TickRequest) -> dict[str, Any]:
-        async with self.lock:
+        async with self._mutation():
             tick = Tick(
                 symbol=request.symbol,
+                name=request.name or instrument_name(request.symbol),
                 price=request.price,
                 bid=request.bid,
                 ask=request.ask,
@@ -146,6 +198,7 @@ class PaperEngine:
                 timestamp=request.timestamp,
             )
             self.ticks[tick.symbol] = tick
+            self.tick_history[tick.symbol].append(tick)
             self.price_history[tick.symbol].append(tick.price)
             self.metrics["ticks_received"] += 1
 
@@ -163,7 +216,7 @@ class PaperEngine:
             }
 
     async def place_order(self, request: OrderRequest) -> dict[str, Any]:
-        async with self.lock:
+        async with self._mutation():
             return self._place_order_unlocked(request)
 
     def _place_order_unlocked(self, request: OrderRequest) -> dict[str, Any]:
@@ -255,10 +308,10 @@ class PaperEngine:
         assert order.price is not None
         return order.price
 
-    def _fill_order(self, order: PaperOrder, price: Decimal) -> None:
+    def _fill_order(self, order: PaperOrder, price: Decimal, *, recorded_fee: Decimal | None = None) -> None:
         self._release_reservation(order)
         notional = self._money(price * order.quantity)
-        fee = self._money(notional * self.fee_rate)
+        fee = recorded_fee if recorded_fee is not None else self._money(notional * self.fee_rate)
         position = self.positions.setdefault(order.symbol, Position(order.symbol))
 
         if order.side is OrderSide.BUY:
@@ -271,15 +324,24 @@ class PaperEngine:
                 ((position.quantity * position.average_price) + notional) / new_quantity
             )
             position.quantity = new_quantity
+            position.remaining_buy_fees += fee
             self.cash -= total
         else:
             if order.quantity > position.quantity:
                 self._reject(order, "sellable quantity changed before fill")
                 return
-            pnl = self._money((price - position.average_price) * order.quantity - fee)
+            # Recognize acquisition fees only for the quantity being sold.
+            # The final sale consumes the full residual to avoid rounding drift.
+            buy_fee = position.remaining_buy_fees if order.quantity == position.quantity else self._money(
+                position.remaining_buy_fees * order.quantity / position.quantity
+            )
+            gross_pnl = self._money((price - position.average_price) * order.quantity)
+            pnl = self._money(gross_pnl - buy_fee - fee)
+            position.remaining_buy_fees -= buy_fee
             position.quantity -= order.quantity
             position.realized_pnl += pnl
             self.realized_pnl += pnl
+            self.realized_pnl_before_fees += gross_pnl
             self.cash += notional - fee
             if position.quantity == 0:
                 position.average_price = Decimal("0")
@@ -300,7 +362,7 @@ class PaperEngine:
         self.metrics["orders_rejected"] += 1
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
-        async with self.lock:
+        async with self._mutation():
             order = self.orders.get(order_id)
             if order is None:
                 raise EngineError("order_not_found", "order was not found", 404)
@@ -313,7 +375,7 @@ class PaperEngine:
             return self._order_dict(order)
 
     async def create_strategy(self, request: StrategyRequest) -> dict[str, Any]:
-        async with self.lock:
+        async with self._mutation():
             strategy = Strategy(
                 strategy_id=f"strategy-{uuid4().hex[:12]}",
                 name=request.name,
@@ -332,7 +394,7 @@ class PaperEngine:
             return [self._strategy_dict(strategy) for strategy in self.strategies.values()]
 
     async def run_strategies(self) -> list[dict[str, Any]]:
-        async with self.lock:
+        async with self._mutation():
             results: list[dict[str, Any]] = []
             for strategy in self.strategies.values():
                 results.append(self._run_strategy_unlocked(strategy))
@@ -420,18 +482,18 @@ class PaperEngine:
         )
 
     async def pause(self) -> dict[str, Any]:
-        async with self.lock:
+        async with self._mutation():
             self.trading_enabled = False
             return self.control_state("paper trading paused")
 
     async def resume(self) -> dict[str, Any]:
-        async with self.lock:
+        async with self._mutation():
             self.kill_switch = False
             self.trading_enabled = True
             return self.control_state("paper trading resumed")
 
     async def kill(self) -> dict[str, Any]:
-        async with self.lock:
+        async with self._mutation():
             self.kill_switch = True
             self.trading_enabled = False
             return self.control_state("kill switch enabled")
@@ -447,9 +509,12 @@ class PaperEngine:
     async def account(self) -> dict[str, Any]:
         async with self.lock:
             market_value = sum(
-                (position.quantity * self.ticks[position.symbol].price)
-                for position in self.positions.values()
-                if position.symbol in self.ticks
+                (
+                    position.quantity * self.ticks[position.symbol].price
+                    for position in self.positions.values()
+                    if position.symbol in self.ticks
+                ),
+                Decimal("0"),
             )
             return {
                 "mode": self.mode,
@@ -460,6 +525,8 @@ class PaperEngine:
                 "market_value": self._money(market_value),
                 "equity": self._money(self.cash + market_value),
                 "realized_pnl": self.realized_pnl,
+                "realized_pnl_before_fees": self.realized_pnl_before_fees,
+                "realized_fees": self.realized_pnl_before_fees - self.realized_pnl,
                 "trading_enabled": self.trading_enabled,
                 "kill_switch": self.kill_switch,
                 "as_of": utc_now(),
@@ -468,6 +535,161 @@ class PaperEngine:
     async def positions_snapshot(self) -> list[dict[str, Any]]:
         async with self.lock:
             return [self._position_dict(position) for position in self.positions.values()]
+
+    async def ticks_snapshot(self) -> list[dict[str, Any]]:
+        """Return up to ten symbols with the newest ticks."""
+
+        async with self.lock:
+            latest = sorted(
+                self.ticks.values(),
+                key=lambda tick: (tick.timestamp, tick.received_at),
+                reverse=True,
+            )[:10]
+            return [self._tick_dict(tick) for tick in latest]
+
+    async def chart_snapshot(self, symbol: str) -> dict[str, Any]:
+        """Return one-minute close bars and filled buy markers for a symbol."""
+
+        normalized = symbol.strip().upper()
+        async with self.lock:
+            tick = self.ticks.get(normalized)
+            items = self.tick_history.get(normalized, ())
+            markers = [
+                {
+                    "price": order.average_filled_price,
+                    "timestamp": order.filled_at,
+                }
+                for order in self.orders.values()
+                if order.symbol == normalized
+                and order.side is OrderSide.BUY
+                and order.status is OrderStatus.FILLED
+                and order.average_filled_price is not None
+                and order.filled_at is not None
+            ]
+            bars: dict[int, dict[str, Any]] = {}
+            for item in sorted(items, key=lambda value: value.timestamp):
+                bucket = int(item.timestamp.timestamp()) // 60 * 60
+                bar = bars.get(bucket)
+                if bar is None:
+                    bars[bucket] = {
+                        "timestamp": datetime.fromtimestamp(bucket, tz=timezone.utc),
+                        "open": item.price,
+                        "high": item.price,
+                        "low": item.price,
+                        "close": item.price,
+                        "price": item.price,
+                        "volume": item.volume or Decimal("0"),
+                    }
+                else:
+                    bar["high"] = max(bar["high"], item.price)
+                    bar["low"] = min(bar["low"], item.price)
+                    bar["close"] = item.price
+                    bar["price"] = item.price
+                    bar["volume"] += item.volume or Decimal("0")
+            return {
+                "symbol": normalized,
+                "name": tick.name if tick else instrument_name(normalized),
+                "interval": "1m",
+                "items": [
+                    bar for bar in bars.values()
+                ],
+                "buy_markers": markers,
+            }
+
+    async def add_auto_symbol(self, request: AutoStrategySymbolRequest) -> dict[str, Any]:
+        async with self._mutation():
+            tick = self.ticks.get(request.symbol)
+            if tick is None:
+                raise EngineError("price_unavailable", "최근 시세에 있는 종목만 자동매매 목록에 담을 수 있습니다.", 409)
+            self.auto_watchlist.setdefault(request.symbol, utc_now())
+            self.auto_strategy_settings.setdefault(request.symbol, AutoStrategySettings())
+            return self._auto_watchlist_dict(request.symbol)
+
+    async def auto_watchlist_snapshot(self) -> list[dict[str, Any]]:
+        async with self.lock:
+            return [self._auto_watchlist_dict(symbol) for symbol in self.auto_watchlist]
+
+    async def remove_auto_symbol(self, symbol: str) -> dict[str, Any]:
+        normalized = symbol.strip().upper()
+        async with self._mutation():
+            if normalized not in self.auto_watchlist:
+                raise EngineError("auto_symbol_not_found", "자동매매 목록에서 종목을 찾을 수 없습니다.", 404)
+            self.auto_watchlist.pop(normalized)
+            self.auto_strategy_settings.pop(normalized, None)
+            strategy_id = self.auto_strategy_ids.get(normalized)
+            if strategy_id in self.strategies:
+                self.strategies[strategy_id].enabled = False
+            return {"symbol": normalized, "removed": True}
+
+    async def activate_auto_strategies(
+        self,
+        settings_by_symbol: dict[str, AutoStrategySettings] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Create or update each queued symbol using its own PAPER settings."""
+
+        settings_by_symbol = settings_by_symbol or {}
+        async with self._mutation():
+            for symbol in self.auto_watchlist:
+                settings = settings_by_symbol.get(
+                    symbol,
+                    self.auto_strategy_settings.get(symbol, AutoStrategySettings()),
+                )
+                self.auto_strategy_settings[symbol] = settings
+                strategy_id = self.auto_strategy_ids.get(symbol)
+                strategy = self.strategies.get(strategy_id or "")
+                if strategy is None:
+                    strategy = Strategy(
+                        strategy_id=f"auto-{uuid4().hex[:12]}",
+                        name=f"auto-{symbol}",
+                        symbol=symbol,
+                        short_window=settings.short_window,
+                        long_window=settings.long_window,
+                        order_quantity=settings.order_quantity,
+                        max_position=settings.order_quantity,
+                        enabled=True,
+                    )
+                    self.strategies[strategy.strategy_id] = strategy
+                    self.auto_strategy_ids[symbol] = strategy.strategy_id
+                else:
+                    parameters_changed = (
+                        strategy.short_window != settings.short_window
+                        or strategy.long_window != settings.long_window
+                        or strategy.order_quantity != settings.order_quantity
+                    )
+                    strategy.short_window = settings.short_window
+                    strategy.long_window = settings.long_window
+                    strategy.order_quantity = settings.order_quantity
+                    strategy.max_position = settings.order_quantity
+                    strategy.enabled = True
+                    if parameters_changed:
+                        strategy.previous_relation = None
+            return [self._auto_watchlist_dict(symbol) for symbol in self.auto_watchlist]
+
+    async def auto_strategy_symbols(self) -> list[str]:
+        async with self.lock:
+            return [
+                symbol for symbol in self.auto_watchlist
+                if (strategy := self.strategies.get(self.auto_strategy_ids.get(symbol, ""))) is not None
+                and strategy.enabled
+            ]
+
+    def _auto_watchlist_dict(self, symbol: str) -> dict[str, Any]:
+        tick = self.ticks.get(symbol)
+        strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+        settings = self.auto_strategy_settings.get(symbol)
+        short_window = strategy.short_window if strategy is not None else settings.short_window if settings else None
+        long_window = strategy.long_window if strategy is not None else settings.long_window if settings else None
+        order_quantity = strategy.order_quantity if strategy is not None else settings.order_quantity if settings else None
+        return {
+            "symbol": symbol,
+            "name": tick.name if tick else instrument_name(symbol),
+            "added_at": self.auto_watchlist[symbol],
+            "status": "운영 중" if strategy is not None and strategy.enabled else "대기 중",
+            "strategy_id": strategy.strategy_id if strategy is not None else None,
+            "short_window": short_window,
+            "long_window": long_window,
+            "order_quantity": order_quantity,
+        }
 
     async def orders_snapshot(self, status: OrderStatus | None = None) -> list[dict[str, Any]]:
         async with self.lock:
@@ -512,6 +734,7 @@ class PaperEngine:
     def _tick_dict(tick: Tick) -> dict[str, Any]:
         return {
             "symbol": tick.symbol,
+            "name": tick.name,
             "price": tick.price,
             "bid": tick.bid,
             "ask": tick.ask,
@@ -560,6 +783,7 @@ class PaperEngine:
             "order_id": order.order_id,
             "client_order_id": order.client_order_id,
             "symbol": order.symbol,
+            "name": instrument_name(order.symbol),
             "side": order.side,
             "quantity": order.quantity,
             "order_type": order.order_type,
