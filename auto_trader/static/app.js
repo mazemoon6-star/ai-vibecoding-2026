@@ -17,11 +17,32 @@ function money(value, maximumFractionDigits = 4) {
   return Number.isFinite(number) ? number.toLocaleString("ko-KR", { maximumFractionDigits }) : esc(value);
 }
 
+function currencyMoney(value, currency = "KRW", signed = false) {
+  if (value === null || value === undefined) return "-";
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return esc(value);
+  const digits = currency === "USD" ? 2 : 0;
+  const threshold = 0.5 * (10 ** -digits);
+  const number = Math.abs(parsed) < threshold ? 0 : parsed;
+  const sign = signed && number > 0 ? "+" : number < 0 ? "-" : "";
+  const prefix = currency === "USD" ? "$" : "₩";
+  return `${sign}${prefix}${Math.abs(number).toLocaleString("ko-KR", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  })}`;
+}
+
+function positionCurrency(position) {
+  if (position.currency === "KRW" || position.currency === "USD") return position.currency;
+  return /^\d{6}$/.test(String(position.symbol || "")) ? "KRW" : "USD";
+}
+
 function percent(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "-";
-  const formatted = (number * 100).toLocaleString("ko-KR", { maximumFractionDigits: 2, signDisplay: "always" });
-  return `${formatted}%`;
+  const percentage = Math.abs(number * 100) < 0.005 ? 0 : number * 100;
+  const formatted = Math.abs(percentage).toLocaleString("ko-KR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `${percentage > 0 ? "+" : percentage < 0 ? "-" : ""}${formatted}%`;
 }
 
 function date(value, omitSeconds = false) {
@@ -57,42 +78,66 @@ function rows(target, values, template, empty = "데이터가 없습니다.") {
 
 async function refresh() {
   try {
-    const [account, positions, strategies, broker, autoSymbols] = await Promise.all([
+    const [account, positions, strategies, broker, autoSymbols, exchangeRate] = await Promise.all([
       api("/api/v1/account"), api("/api/v1/positions"),
       api("/api/v1/strategies"), api("/api/v1/broker/status"),
-      api("/api/v1/auto-trade-symbols")
+      api("/api/v1/auto-trade-symbols"),
+      api("/api/v1/market/exchange-rate").catch(() => null)
     ]);
     const a = account;
+    const hasUsdPositions = positions.items.some((position) => positionCurrency(position) === "USD" && Number(position.quantity) > 0);
     $("#mode").textContent = a.mode || "PAPER";
     $("#trading-status").textContent = a.trading_enabled ? "거래 활성" : "거래 정지";
-    $("#available-cash").textContent = money(a.available_cash, 0);
-    $("#equity").textContent = money(a.equity, 0);
-    $("#realized-pnl").textContent = money(a.realized_pnl, 0);
-    $("#realized-pnl-before-fees").textContent = money(a.realized_pnl_before_fees, 0);
-    $("#as-of").textContent = `기준 ${date(a.as_of)}`;
+    $("#available-cash").textContent = hasUsdPositions ? money(a.available_cash, 0) : currencyMoney(a.available_cash);
+    $("#cash-note").textContent = hasUsdPositions ? "PAPER 장부 잔액 · 혼합 통화" : "예약 금액 제외";
+    $("#equity-label").textContent = hasUsdPositions ? "PAPER 장부 평가액" : "총 평가금액";
+    $("#equity").textContent = hasUsdPositions ? money(a.equity, 0) : currencyMoney(a.equity);
+    $("#realized-pnl").textContent = currencyMoney(a.realized_pnl, "KRW", true);
+    $("#realized-pnl-before-fees").textContent = currencyMoney(a.realized_pnl_before_fees, "KRW", true);
+    $("#as-of").textContent = `${hasUsdPositions ? "KRW·USD 단순 합산 · " : ""}기준 ${date(a.as_of)}`;
     const configured = broker.market_data?.enabled && broker.market_data?.credentials_configured;
     $("#broker-badge").textContent = configured ? "토스 시세 연동 준비됨" : "토스 시세 미설정";
     $("#broker-badge").classList.toggle("muted", !configured);
     queuedAutoTradeSymbols = new Set(autoSymbols.items.map((item) => item.symbol));
-    const heldSymbols = new Set(positions.items
+    const heldQuantities = new Map(positions.items
       .filter((position) => Number(position.quantity) > 0)
-      .map((position) => position.symbol));
+      .map((position) => [position.symbol, position.quantity]));
     const stockNames = new Map(autoSymbols.items.map((item) => [item.symbol, item.name || item.symbol]));
-    investmentChart.render(positions.items, stockNames);
-    rows($("#positions-body"), positions.items, (position) => `<tr><td><strong>${esc(position.symbol)}</strong></td><td>${esc(stockNames.get(position.symbol) || position.symbol)}</td><td>${money(position.quantity)}</td><td>${money(position.average_price, 0)}</td><td>${money(position.market_price, 0)}</td><td>${money(position.unrealized_pnl, 0)}</td></tr>`);
+    const fxRates = new Map([["KRW", 1]]);
+    if (exchangeRate?.baseCurrency === "USD" && exchangeRate?.quoteCurrency === "KRW" && Number(exchangeRate.rate) > 0) {
+      fxRates.set("USD", Number(exchangeRate.rate));
+    }
+    investmentChart.render(positions.items, stockNames, fxRates);
+    rows($("#positions-body"), positions.items, (position) => {
+      const currency = positionCurrency(position);
+      const pnl = Number(position.unrealized_pnl);
+      const costBasis = Number(position.cost_basis ?? Number(position.average_price) * Number(position.quantity));
+      const pnlReturn = position.unrealized_return ?? (Number.isFinite(pnl) && costBasis > 0 ? pnl / costBasis : null);
+      const pnlClass = pnl > 0 ? "positive" : pnl < 0 ? "negative" : "neutral";
+      return `<tr>
+        <td><strong>${esc(position.symbol)}</strong></td>
+        <td>${esc(position.name || stockNames.get(position.symbol) || position.symbol)}</td>
+        <td>${money(position.quantity)}</td>
+        <td>${currencyMoney(position.average_price, currency)}</td>
+        <td>${currencyMoney(position.market_price, currency)}</td>
+        <td><span class="position-pnl ${pnlClass}">${currencyMoney(position.unrealized_pnl, currency, true)}</span><small class="position-return ${pnlClass}">${percent(pnlReturn)}</small></td>
+        <td><span class="price-time">${date(position.price_updated_at, true)}</span><small class="currency-code">${currency}</small></td>
+      </tr>`;
+    });
     rows($("#auto-trade-symbols-body"), autoSymbols.items, (item) => {
-      const settings = { ...item, ...(autoStrategyDrafts.get(item.symbol) || {}) };
+      const draft = autoStrategyDrafts.get(item.symbol);
+      const settings = { ...item, ...(draft || {}) };
       return `<tr data-symbol="${esc(item.symbol)}">
         <td data-label="심볼"><strong>${esc(item.symbol)}</strong></td>
         <td data-label="종목명">${esc(item.name)}</td>
         <td data-label="상태">${esc(item.status)}</td>
-        <td data-label="단기 창"><input class="auto-setting-input" aria-label="${esc(item.name)} 단기 창" type="number" min="2" max="200" step="1" data-auto-setting="short_window" value="${esc(settings.short_window ?? 3)}" /></td>
-        <td data-label="장기 창"><input class="auto-setting-input" aria-label="${esc(item.name)} 장기 창" type="number" min="3" max="500" step="1" data-auto-setting="long_window" value="${esc(settings.long_window ?? 8)}" /></td>
-        <td data-label="주문 수량"><input class="auto-setting-input" aria-label="${esc(item.name)} 주문 수량" type="number" min="0.00000001" step="any" data-auto-setting="order_quantity" value="${esc(settings.order_quantity ?? 1)}" /></td>
-        <td class="auto-symbol-action">${heldSymbols.has(item.symbol) ? '<span class="pill">보유 중</span>' : `<button class="button ghost remove-auto-symbol" type="button" data-remove-auto-symbol="${esc(item.symbol)}">제외</button>`}</td>
+        <td data-label="현재 보유">${money(heldQuantities.get(item.symbol) || 0)}주</td>
+        <td data-label="1회 주문 수량"><div class="auto-setting-control"><input class="auto-setting-input" aria-label="${esc(item.name)} 1회 주문 수량" type="number" min="0.00000001" step="any" data-auto-setting="order_quantity" value="${esc(settings.order_quantity ?? 1)}" /><small class="setting-state${draft ? " pending" : ""}" data-setting-state>${draft ? "변경됨 · 재개 시 적용" : "적용됨"}</small></div></td>
+        <td class="auto-symbol-action">${heldQuantities.has(item.symbol) ? '<span class="pill" title="보유 포지션을 먼저 정리해야 제외할 수 있습니다.">보유 중</span>' : `<button class="button ghost remove-auto-symbol" type="button" data-remove-auto-symbol="${esc(item.symbol)}">제외</button>`}</td>
       </tr>`;
     });
-    rows($("#strategies-body"), strategies.items, (strategy) => `<tr><td>${esc(strategy.name)}</td><td>${esc(strategy.symbol)}</td><td>${strategy.short_window} / ${strategy.long_window}</td><td>${strategy.enabled ? "활성" : "중지"}</td></tr>`);
+    const activeStrategies = strategies.items.filter((strategy) => strategy.enabled && queuedAutoTradeSymbols.has(strategy.symbol));
+    rows($("#strategies-body"), activeStrategies, (strategy) => `<tr><td>${esc(stockNames.get(strategy.symbol) || strategy.symbol)} 자동매매</td><td>${esc(strategy.symbol)}</td><td><span class="badge">운영 중</span></td></tr>`, "현재 실행 중인 전략이 없습니다.");
     const refreshedAt = new Date();
     $("#last-refreshed").textContent = `마지막 갱신 ${date(refreshedAt)}`;
     $("#last-refreshed").dateTime = refreshedAt.toISOString();
@@ -109,18 +154,17 @@ async function postControl(action) {
       const settings = {};
       for (const row of document.querySelectorAll("#auto-trade-symbols-body tr[data-symbol]")) {
         const symbol = row.dataset.symbol;
-        const shortWindow = Number(row.querySelector('[data-auto-setting="short_window"]').value);
-        const longWindow = Number(row.querySelector('[data-auto-setting="long_window"]').value);
         const orderQuantity = row.querySelector('[data-auto-setting="order_quantity"]').value;
-        if (!Number.isInteger(shortWindow) || !Number.isInteger(longWindow) || shortWindow < 2 || longWindow < 3 || shortWindow >= longWindow || !Number.isFinite(Number(orderQuantity)) || !(Number(orderQuantity) > 0)) {
-          throw new Error(`${symbol}: \uB2E8\uAE30\u00B7\uC7A5\uAE30 \uCC3D\uACFC \uC8FC\uBB38 \uC218\uB7C9\uC744 \uD655\uC778\uD558\uC138\uC694. (\uB2E8\uAE30 \uCC3D\uC740 \uC7A5\uAE30 \uCC3D\uBCF4\uB2E4 \uC791\uC544\uC57C \uD569\uB2C8\uB2E4.)`);
+        if (!Number.isFinite(Number(orderQuantity)) || !(Number(orderQuantity) > 0)) {
+          throw new Error(`${symbol}: 주문 수량은 0보다 큰 숫자로 입력하세요.`);
         }
-        settings[symbol] = { short_window: shortWindow, long_window: longWindow, order_quantity: orderQuantity };
+        settings[symbol] = { order_quantity: orderQuantity };
         autoStrategyDrafts.set(symbol, settings[symbol]);
       }
       options.body = JSON.stringify({ settings });
     }
     const result = await api(`/api/v1/controls/${action}`, options);
+    if (action === "resume") autoStrategyDrafts.clear();
     const count = result.auto_strategies?.length || 0;
     show(action === "resume" && count
       ? `거래 재개: ${count}개 종목의 이동평균 PAPER 전략을 시작했습니다.`
@@ -172,6 +216,11 @@ $("#auto-trade-symbols-body").addEventListener("input", (event) => {
   const current = autoStrategyDrafts.get(row.dataset.symbol) || {};
   current[input.dataset.autoSetting] = input.value;
   autoStrategyDrafts.set(row.dataset.symbol, current);
+  const state = row.querySelector("[data-setting-state]");
+  if (state) {
+    state.textContent = "변경됨 · 재개 시 적용";
+    state.classList.add("pending");
+  }
 });
 
 $("#volume-search-form").addEventListener("submit", async (event) => {
@@ -209,5 +258,97 @@ $("#volume-search-form").addEventListener("submit", async (event) => {
 });
 document.querySelectorAll("[data-control]").forEach((button) => button.addEventListener("click", () => postControl(button.dataset.control)));
 
+const assistantHistory = [];
+let assistantConfigured = false;
+let assistantBusy = false;
+
+function appendAssistantMessage(role, message, extraClass = "") {
+  const element = document.createElement("div");
+  element.className = `assistant-message assistant-message-${role}${extraClass ? ` ${extraClass}` : ""}`;
+  element.textContent = message;
+  $("#assistant-messages").appendChild(element);
+  $("#assistant-messages").scrollTop = $("#assistant-messages").scrollHeight;
+  return element;
+}
+
+function setAssistantEnabled(enabled) {
+  assistantConfigured = enabled;
+  $("#assistant-input").disabled = !enabled;
+  $("#assistant-send").disabled = !enabled;
+  document.querySelectorAll("[data-assistant-prompt]").forEach((button) => { button.disabled = !enabled; });
+}
+
+async function initializeAssistant() {
+  try {
+    const status = await api("/api/v1/assistant/status");
+    const statusElement = $("#assistant-status");
+    statusElement.textContent = status.configured ? "사용 가능" : "API 키 필요";
+    statusElement.classList.toggle("ready", status.configured);
+    statusElement.classList.toggle("error", !status.configured);
+    setAssistantEnabled(status.configured);
+    if (!status.configured) {
+      appendAssistantMessage("bot", "서버의 .env에 OPENAI_API_KEY를 설정하고 앱을 다시 시작하면 채팅을 사용할 수 있습니다.", "assistant-message-error");
+    }
+  } catch (error) {
+    $("#assistant-status").textContent = "연결 실패";
+    $("#assistant-status").classList.add("error");
+    setAssistantEnabled(false);
+  }
+}
+
+function setAssistantOpen(open) {
+  $("#assistant-panel").hidden = !open;
+  $("#assistant-toggle").setAttribute("aria-expanded", String(open));
+  if (open && assistantConfigured) $("#assistant-input").focus();
+}
+
+async function sendAssistantMessage(rawMessage) {
+  const message = rawMessage.trim();
+  if (!message || !assistantConfigured || assistantBusy) return;
+  const previousHistory = assistantHistory.slice(-10);
+  assistantHistory.push({ role: "user", content: message });
+  appendAssistantMessage("user", message);
+  assistantBusy = true;
+  $("#assistant-send").disabled = true;
+  $("#assistant-input").disabled = true;
+  const thinking = appendAssistantMessage("bot", "답변을 준비하고 있습니다…", "assistant-message-thinking");
+  try {
+    const result = await api("/api/v1/assistant/chat", {
+      method: "POST",
+      body: JSON.stringify({ message, history: previousHistory })
+    });
+    thinking.remove();
+    assistantHistory.push({ role: "assistant", content: result.reply });
+    if (assistantHistory.length > 12) assistantHistory.splice(0, assistantHistory.length - 12);
+    appendAssistantMessage("bot", result.reply);
+  } catch (error) {
+    thinking.remove();
+    appendAssistantMessage("bot", error.message, "assistant-message-error");
+  } finally {
+    assistantBusy = false;
+    $("#assistant-send").disabled = false;
+    $("#assistant-input").disabled = false;
+    $("#assistant-input").focus();
+  }
+}
+
+$("#assistant-toggle").addEventListener("click", () => setAssistantOpen($("#assistant-panel").hidden));
+$("#assistant-close").addEventListener("click", () => setAssistantOpen(false));
+$("#assistant-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const message = $("#assistant-input").value;
+  $("#assistant-input").value = "";
+  await sendAssistantMessage(message);
+});
+$("#assistant-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    $("#assistant-form").requestSubmit();
+  }
+});
+document.querySelectorAll("[data-assistant-prompt]").forEach((button) => button.addEventListener("click", () => sendAssistantMessage(button.dataset.assistantPrompt)));
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") setAssistantOpen(false); });
+
 refresh();
+initializeAssistant();
 setInterval(refresh, 5000);

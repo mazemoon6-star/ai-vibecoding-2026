@@ -25,6 +25,7 @@ INSTRUMENT_NAMES: dict[str, str] = {
     "083450": "GST",
     # Cooling and data-center watchlist symbols.
     "CARR": "Carrier Global",
+    "AAPL": "Apple",
     "MOD": "Modine Manufacturing",
     "NVT": "nVent Electric",
     "SMCI": "Super Micro Computer",
@@ -40,3 +41,10 @@ def instrument_name(symbol: str) -> str:
 
     normalized = symbol.strip().upper()
     return INSTRUMENT_NAMES.get(normalized, normalized)
+
+
+def instrument_currency(symbol: str) -> str:
+    """Infer the display currency when broker metadata is not available."""
+
+    normalized = symbol.strip().upper()
+    return "KRW" if normalized == "TEST" or (normalized.isdigit() and len(normalized) == 6) else "USD"

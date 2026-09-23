@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -52,6 +52,7 @@ class TickRequest(BaseModel):
     bid: Decimal | None = Field(default=None, gt=0)
     ask: Decimal | None = Field(default=None, gt=0)
     volume: Decimal | None = Field(default=None, ge=0)
+    currency: Literal["KRW", "USD"] | None = None
     timestamp: datetime = Field(default_factory=utc_now)
 
     @field_validator("symbol")
@@ -125,13 +126,17 @@ class OrderRequest(BaseModel):
         return self
 
 
+AUTO_STRATEGY_SHORT_WINDOW = 180
+AUTO_STRATEGY_LONG_WINDOW = 460
+
+
 class AutoStrategySettings(BaseModel):
     """Moving-average settings for one auto-trade symbol."""
 
     model_config = ConfigDict(extra="forbid")
 
-    short_window: int = Field(default=3, ge=2, le=200)
-    long_window: int = Field(default=8, ge=3, le=500)
+    short_window: int = Field(default=AUTO_STRATEGY_SHORT_WINDOW, ge=2, le=200)
+    long_window: int = Field(default=AUTO_STRATEGY_LONG_WINDOW, ge=3, le=500)
     order_quantity: Decimal = Field(default=Decimal("1"), gt=0)
 
     @model_validator(mode="after")
@@ -141,17 +146,25 @@ class AutoStrategySettings(BaseModel):
         return self
 
 
-class AutoStrategyResumeRequest(BaseModel):
-    """Per-symbol moving-average settings submitted when resuming trading."""
+class AutoStrategyOrderSettings(BaseModel):
+    """The only user-editable setting for an automatic strategy."""
 
     model_config = ConfigDict(extra="forbid")
 
-    settings: dict[str, AutoStrategySettings] = Field(default_factory=dict)
+    order_quantity: Decimal = Field(gt=0)
+
+
+class AutoStrategyResumeRequest(BaseModel):
+    """Per-symbol order quantities submitted when resuming trading."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    settings: dict[str, AutoStrategyOrderSettings] = Field(default_factory=dict)
 
     @field_validator("settings")
     @classmethod
-    def normalize_settings_symbols(cls, values: dict[str, AutoStrategySettings]) -> dict[str, AutoStrategySettings]:
-        normalized: dict[str, AutoStrategySettings] = {}
+    def normalize_settings_symbols(cls, values: dict[str, AutoStrategyOrderSettings]) -> dict[str, AutoStrategyOrderSettings]:
+        normalized: dict[str, AutoStrategyOrderSettings] = {}
         for symbol, settings in values.items():
             key = symbol.strip().upper()
             if not key:
@@ -212,3 +225,25 @@ class ApiError(BaseModel):
     code: str
     message: str
     data: dict[str, Any] | None = None
+
+
+class AssistantHistoryMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class AssistantChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(min_length=1, max_length=2000)
+    history: list[AssistantHistoryMessage] = Field(default_factory=list, max_length=12)
+
+    @field_validator("message")
+    @classmethod
+    def normalize_message(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("message must not be blank")
+        return value

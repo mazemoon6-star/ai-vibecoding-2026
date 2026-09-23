@@ -17,10 +17,11 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import TossConfig, load_local_env
 from .instruments import instrument_name
-from .models import AutoStrategyResumeRequest, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderStatus, StrategyRequest, TickRequest
+from .models import AssistantChatRequest, AutoStrategyResumeRequest, AutoStrategySettings, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderStatus, StrategyRequest, TickRequest
 from .paper_engine import EngineError, PaperEngine
 from .related_stock_search import expand_keyword, search_direct_stocks, search_related_stocks
 from .toss_client import TossApiError, TossClient
+from .trading_assistant import TradingAssistantClient, TradingAssistantError
 
 
 load_local_env()
@@ -42,12 +43,41 @@ engine = PaperEngine(
 )
 toss_config = TossConfig.from_env()
 toss_client = TossClient(toss_config)
+trading_assistant = TradingAssistantClient()
 STATIC_DIR = Path(__file__).parent / "static"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 STATE_PATH = Path(os.getenv("PAPER_STATE_PATH", "data/paper_state.sqlite3"))
 if not STATE_PATH.is_absolute():
     STATE_PATH = PROJECT_DIR / STATE_PATH
 logger = logging.getLogger(__name__)
+exchange_rate_cache: dict[str, object] | None = None
+exchange_rate_lock = asyncio.Lock()
+
+
+async def _usd_krw_exchange_rate() -> dict[str, object]:
+    """Reuse a quote until the broker-declared validity window ends."""
+
+    global exchange_rate_cache
+    now = datetime.now(timezone.utc)
+    if exchange_rate_cache is not None:
+        valid_until = exchange_rate_cache.get("validUntil")
+        if isinstance(valid_until, str):
+            try:
+                if now < datetime.fromisoformat(valid_until.replace("Z", "+00:00")):
+                    return exchange_rate_cache
+            except ValueError:
+                pass
+    async with exchange_rate_lock:
+        if exchange_rate_cache is not None:
+            valid_until = exchange_rate_cache.get("validUntil")
+            if isinstance(valid_until, str):
+                try:
+                    if now < datetime.fromisoformat(valid_until.replace("Z", "+00:00")):
+                        return exchange_rate_cache
+                except ValueError:
+                    pass
+        exchange_rate_cache = await toss_client.get_exchange_rate("USD", "KRW")
+        return exchange_rate_cache
 
 
 async def _market_data_monitor() -> None:
@@ -78,7 +108,13 @@ async def _market_data_monitor() -> None:
                         except ValueError:
                             pass
                     await engine.update_tick(
-                        TickRequest(symbol=symbol, name=instrument_name(symbol), price=price, timestamp=timestamp)
+                        TickRequest(
+                            symbol=symbol,
+                            name=instrument_name(symbol),
+                            price=price,
+                            currency=item.get("currency") if item.get("currency") in {"KRW", "USD"} else None,
+                            timestamp=timestamp,
+                        )
                     )
                 if engine.trading_enabled:
                     await engine.run_strategies()
@@ -95,6 +131,7 @@ async def _market_data_monitor() -> None:
 async def lifespan(_: FastAPI):
     """Restore the account before polling; every state mutation is committed."""
     engine.enable_persistence(STATE_PATH)
+    await engine.enforce_fixed_auto_windows()
     monitor_task = asyncio.create_task(_market_data_monitor()) if toss_client.configured else None
     try:
         yield
@@ -148,6 +185,14 @@ async def toss_error_handler(_: Request, exc: TossApiError) -> JSONResponse:
     )
 
 
+@app.exception_handler(TradingAssistantError)
+async def trading_assistant_error_handler(_: Request, exc: TradingAssistantError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message, "data": None}},
+    )
+
+
 @app.get("/dashboard", include_in_schema=False)
 async def dashboard() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -190,9 +235,46 @@ async def account() -> dict[str, object]:
     return await engine.account()
 
 
+@app.get("/api/v1/assistant/status")
+async def assistant_status() -> dict[str, object]:
+    """Report capability without exposing the OpenAI API key."""
+
+    return trading_assistant.status()
+
+
+@app.post("/api/v1/assistant/chat")
+async def assistant_chat(request: AssistantChatRequest) -> dict[str, object]:
+    """Answer against a read-only snapshot of the current PAPER account."""
+
+    def without_windows(items: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [
+            {key: value for key, value in item.items() if key not in {"short_window", "long_window"}}
+            for item in items
+        ]
+
+    snapshot = {
+        "captured_at": datetime.now(timezone.utc),
+        "account": await engine.account(),
+        "positions": await engine.positions_snapshot(),
+        "orders": (await engine.orders_snapshot())[-20:],
+        "auto_trade_symbols": without_windows(await engine.auto_watchlist_snapshot()),
+        "strategies": without_windows(await engine.list_strategies()),
+    }
+    reply = await trading_assistant.respond(request, snapshot)
+    return {"reply": reply, "model": trading_assistant.model, "read_only": True}
+
+
 @app.get("/api/v1/positions")
 async def positions() -> dict[str, object]:
     return {"items": await engine.positions_snapshot()}
+
+
+@app.get("/api/v1/market/exchange-rate")
+async def exchange_rate() -> dict[str, object]:
+    """Expose the read-only USD/KRW rate used for comparable dashboard totals."""
+
+    result = await _usd_krw_exchange_rate()
+    return {"source": "toss", **result}
 
 
 @app.get("/api/v1/market/ticks")
@@ -356,6 +438,7 @@ async def sync_market(request: MarketSyncRequest) -> dict[str, object]:
                     else stock_names.get(symbol) or instrument_name(symbol)
                 ),
                 price=price,
+                currency=item.get("currency") if item.get("currency") in {"KRW", "USD"} else None,
                 timestamp=timestamp,
             )
         )
@@ -416,7 +499,11 @@ async def pause() -> dict[str, object]:
 
 @app.post("/api/v1/controls/resume")
 async def resume(request: AutoStrategyResumeRequest = Body(default=AutoStrategyResumeRequest())) -> dict[str, object]:
-    auto_strategies = await engine.activate_auto_strategies(request.settings)
+    fixed_settings = {
+        symbol: AutoStrategySettings(order_quantity=settings.order_quantity)
+        for symbol, settings in request.settings.items()
+    }
+    auto_strategies = await engine.activate_auto_strategies(fixed_settings)
     result = await engine.resume()
     result["auto_strategies"] = auto_strategies
     return result

@@ -112,6 +112,23 @@ class TossClient:
             raise TossApiError("invalid_toss_response", "토스 현재가 응답 형식이 올바르지 않습니다.", 502)
         return [item for item in result if isinstance(item, dict)]
 
+    async def get_exchange_rate(self, base_currency: str = "USD", quote_currency: str = "KRW") -> dict[str, Any]:
+        """Return the current broker-provided currency conversion rate."""
+
+        if base_currency not in {"KRW", "USD"} or quote_currency not in {"KRW", "USD"}:
+            raise TossApiError("invalid_currency", "지원 통화는 KRW와 USD입니다.", 422)
+        if base_currency == quote_currency:
+            raise TossApiError("same_currency", "기준 통화와 표시 통화는 달라야 합니다.", 422)
+        self._require_market_data()
+        payload = await self._get_json(
+            "/api/v1/exchange-rate",
+            {"baseCurrency": base_currency, "quoteCurrency": quote_currency},
+        )
+        result = payload.get("result")
+        if not isinstance(result, dict) or result.get("rate") in (None, ""):
+            raise TossApiError("invalid_toss_response", "토스 환율 응답 형식이 올바르지 않습니다.", 502)
+        return result
+
     async def get_volume_rankings(self, market_country: str) -> dict[str, Any]:
         """Return Toss market-wide trading-volume rankings for KR or US."""
 

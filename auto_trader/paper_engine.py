@@ -18,9 +18,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import uuid4
 
-from .instruments import instrument_name
+from .instruments import instrument_currency, instrument_name
 from .paper_state import PaperStateStore, StateStoreError, dump_engine, restore_engine
 from .models import (
+    AUTO_STRATEGY_LONG_WINDOW,
+    AUTO_STRATEGY_SHORT_WINDOW,
     AutoStrategySettings,
     AutoStrategySymbolRequest,
     ExecutionMode,
@@ -55,6 +57,7 @@ class Tick:
     ask: Decimal | None
     volume: Decimal | None
     timestamp: datetime
+    currency: str | None = None
     received_at: datetime = field(default_factory=utc_now)
 
 
@@ -166,6 +169,29 @@ class PaperEngine:
             store.close()
             raise
 
+    async def enforce_fixed_auto_windows(self) -> None:
+        """Migrate persisted automatic strategies to the analyzed fixed windows."""
+
+        async with self._mutation():
+            for symbol in self.auto_watchlist:
+                strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+                settings = self.auto_strategy_settings.get(symbol)
+                order_quantity = (
+                    strategy.order_quantity if strategy is not None
+                    else settings.order_quantity if settings is not None
+                    else Decimal("1")
+                )
+                self.auto_strategy_settings[symbol] = AutoStrategySettings(order_quantity=order_quantity)
+                if strategy is not None:
+                    changed = (
+                        strategy.short_window != AUTO_STRATEGY_SHORT_WINDOW
+                        or strategy.long_window != AUTO_STRATEGY_LONG_WINDOW
+                    )
+                    strategy.short_window = AUTO_STRATEGY_SHORT_WINDOW
+                    strategy.long_window = AUTO_STRATEGY_LONG_WINDOW
+                    if changed:
+                        strategy.previous_relation = None
+
     @asynccontextmanager
     async def _mutation(self):
         async with self.lock:
@@ -196,6 +222,7 @@ class PaperEngine:
                 ask=request.ask,
                 volume=request.volume,
                 timestamp=request.timestamp,
+                currency=request.currency or instrument_currency(request.symbol),
             )
             self.ticks[tick.symbol] = tick
             self.tick_history[tick.symbol].append(tick)
@@ -739,6 +766,7 @@ class PaperEngine:
             "bid": tick.bid,
             "ask": tick.ask,
             "volume": tick.volume,
+            "currency": tick.currency or instrument_currency(tick.symbol),
             "timestamp": tick.timestamp,
             "received_at": tick.received_at,
         }
@@ -747,18 +775,25 @@ class PaperEngine:
         tick = self.ticks.get(position.symbol)
         market_price = tick.price if tick else None
         market_value = position.quantity * market_price if market_price is not None else None
+        cost_basis = position.quantity * position.average_price
         unrealized = (
             (market_price - position.average_price) * position.quantity
             if market_price is not None
             else None
         )
+        unrealized_return = unrealized / cost_basis if unrealized is not None and cost_basis > 0 else None
         return {
             "symbol": position.symbol,
+            "name": tick.name if tick else instrument_name(position.symbol),
+            "currency": (tick.currency if tick else None) or instrument_currency(position.symbol),
             "quantity": position.quantity,
             "average_price": position.average_price,
             "market_price": market_price,
+            "price_updated_at": tick.timestamp if tick else None,
+            "cost_basis": self._money(cost_basis),
             "market_value": self._money(market_value) if market_value is not None else None,
             "unrealized_pnl": self._money(unrealized) if unrealized is not None else None,
+            "unrealized_return": self._money(unrealized_return) if unrealized_return is not None else None,
             "realized_pnl": position.realized_pnl,
             "reserved_quantity": self.reserved_sell_quantity[position.symbol],
         }

@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>토스 증권자동매매 · PAPER dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=9" />
+    <link rel="stylesheet" href="/static/styles.css?v=11" />
   </head>
   <body>
     <header class="topbar">
@@ -28,8 +28,8 @@
       <div class="account-overview">
         <section class="kpi-grid" aria-label="계좌 요약">
           <article class="card kpi"><span>모드</span><strong id="mode">PAPER</strong><small id="trading-status">확인 중</small></article>
-          <article class="card kpi"><span>가용 현금</span><strong id="available-cash">-</strong><small>예약 금액 제외</small></article>
-          <article class="card kpi"><span>총 평가금액</span><strong id="equity">-</strong><small id="as-of">-</small></article>
+          <article class="card kpi"><span>가용 현금</span><strong id="available-cash">-</strong><small id="cash-note">예약 금액 제외</small></article>
+          <article class="card kpi"><span id="equity-label">총 평가금액</span><strong id="equity">-</strong><small id="as-of">-</small></article>
           <article class="card kpi"><span>실현 손익</span><dl class="pnl-comparison"><div><dt>수수료 반영</dt><dd id="realized-pnl">-</dd></div><div><dt>수수료 미반영</dt><dd id="realized-pnl-before-fees">-</dd></div></dl><small>매도 체결분의 매수·매도 수수료 기준</small></article>
         </section>
 
@@ -75,16 +75,43 @@
       </section>
 
       <div class="two-column">
-        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">AUTO TRADE · PAPER</p><h2>자동매매 종목</h2></div><span class="pill">종목 선택 후 거래 재개</span></div><p class="form-help auto-trade-help">종목별 단기 창, 장기 창, 주문 수량을 입력한 뒤 거래 재개를 누르세요. 설정은 각 종목에만 적용됩니다.</p><div class="table-wrap auto-trade-wrap"><table class="auto-trade-symbols-table"><thead><tr><th>심볼</th><th>종목명</th><th>상태</th><th>단기 창</th><th>장기 창</th><th>주문 수량</th><th></th></tr></thead><tbody id="auto-trade-symbols-body"></tbody></table></div></section>
-        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">MOVING AVERAGE</p><h2>이동평균 전략</h2></div></div><p class="form-help strategy-settings-help">종목별 설정의 단기 평균선이 장기 평균선을 상향 교차하면 매수하고, 하향 교차하면 매도합니다. 창은 시세 데이터 개수입니다.</p><div class="section-heading registered-strategies-heading"><div><p class="eyebrow">STRATEGIES</p><h3>실행 중 전략</h3></div></div><div class="table-wrap"><table><thead><tr><th>이름</th><th>심볼</th><th>창</th><th>활성</th></tr></thead><tbody id="strategies-body"></tbody></table></div></section>
+        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">AUTO TRADE · PAPER</p><h2>자동매매 종목</h2></div><span class="pill">수량 변경 후 거래 재개</span></div><p class="form-help auto-trade-help">1회 매수·매도 주문 수량만 직접 선택합니다. 이동평균 값은 분석된 고정값이 자동 적용됩니다.</p><div class="table-wrap auto-trade-wrap"><table class="auto-trade-symbols-table"><thead><tr><th>심볼</th><th>종목명</th><th>상태</th><th>현재 보유</th><th>1회 주문 수량</th><th></th></tr></thead><tbody id="auto-trade-symbols-body"></tbody></table></div></section>
+        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">MOVING AVERAGE</p><h2>이동평균 전략</h2></div><span class="pill">분석 고정값 적용 중</span></div><p class="form-help strategy-settings-help">분석된 고정 단기·장기 평균선의 교차 신호로 매수·매도하며, 설정값은 화면에 노출하지 않습니다.</p><div class="section-heading registered-strategies-heading"><div><p class="eyebrow">STRATEGIES</p><h3>실행 중 전략</h3></div></div><div class="table-wrap"><table><thead><tr><th>전략</th><th>심볼</th><th>상태</th></tr></thead><tbody id="strategies-body"></tbody></table></div></section>
       </div>
 
       <div class="two-column single-column">
-        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">PORTFOLIO</p><h2>보유 포지션</h2></div><span class="pill">토스 시세 조회 기준 · 약 15초 주기</span></div><div class="table-wrap"><table><thead><tr><th>심볼</th><th>종목명</th><th>수량</th><th>평균가</th><th>현재가</th><th>평가손익</th></tr></thead><tbody id="positions-body"></tbody></table></div></section>
+        <section class="card table-card"><div class="section-heading"><div><p class="eyebrow">PORTFOLIO</p><h2>보유 포지션</h2></div><span class="pill">토스 시세 조회 기준 · 약 15초 주기</span></div><div class="table-wrap"><table class="positions-table"><thead><tr><th>심볼</th><th>종목명</th><th>수량</th><th>평균가</th><th>현재가</th><th>평가손익</th><th>시세 기준</th></tr></thead><tbody id="positions-body"></tbody></table></div></section>
       </div>
     </main>
+
+    <button id="assistant-toggle" class="assistant-launcher" type="button" aria-controls="assistant-panel" aria-expanded="false">
+      <span class="assistant-launcher-icon" aria-hidden="true">✦</span>
+      <span>AI 매매 도우미</span>
+    </button>
+    <aside id="assistant-panel" class="assistant-panel" role="dialog" aria-modal="false" aria-labelledby="assistant-heading" hidden>
+      <header class="assistant-header">
+        <div><p class="eyebrow">READ-ONLY · PAPER</p><h2 id="assistant-heading">AI 매매 도우미</h2></div>
+        <div class="assistant-header-actions"><span id="assistant-status" class="assistant-status">연결 확인 중</span><button id="assistant-close" class="assistant-close" type="button" aria-label="AI 매매 도우미 닫기">×</button></div>
+      </header>
+      <p class="assistant-safety">현재 PAPER 계좌를 읽어 설명합니다. 주문을 실행하거나 설정을 변경하지 않습니다.</p>
+      <div id="assistant-messages" class="assistant-messages" aria-live="polite">
+        <div class="assistant-message assistant-message-bot">안녕하세요. 계좌 현황, 보유 종목, 손익 또는 자동매매 전략 상태를 물어보세요.</div>
+      </div>
+      <div class="assistant-suggestions" aria-label="추천 질문">
+        <button type="button" data-assistant-prompt="현재 계좌 현황을 요약해 주세요.">계좌 요약</button>
+        <button type="button" data-assistant-prompt="보유 종목별 손익과 위험 요인을 설명해 주세요.">보유 종목</button>
+        <button type="button" data-assistant-prompt="현재 자동매매 전략 상태를 설명해 주세요.">전략 상태</button>
+      </div>
+      <form id="assistant-form" class="assistant-form">
+        <label class="sr-only" for="assistant-input">AI 매매 도우미에게 질문</label>
+        <textarea id="assistant-input" rows="2" maxlength="2000" placeholder="예: 현재 손익을 쉽게 설명해 주세요" required></textarea>
+        <button id="assistant-send" class="assistant-send" type="submit">전송</button>
+      </form>
+      <p class="assistant-disclaimer">AI 답변은 참고용이며 미래 수익을 보장하지 않습니다.</p>
+    </aside>
+
     <footer>Automatic Trader v0.2 · 실계좌 주문 API는 비활성화되어 있습니다.</footer>
-    <script src="/static/investment_chart.js?v=1"></script>
-    <script src="/static/app.js?v=12"></script>
+    <script src="/static/investment_chart.js?v=4"></script>
+    <script src="/static/app.js?v=17"></script>
   </body>
 </html>

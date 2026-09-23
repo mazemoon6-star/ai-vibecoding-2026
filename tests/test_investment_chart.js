@@ -56,13 +56,13 @@ function fixture() {
   return { chart: new context.Chart(root), find, document };
 }
 
-const position = (symbol, quantity, average, pnl = null) => ({ symbol, quantity: String(quantity),
-  average_price: String(average), unrealized_pnl: pnl == null ? null : String(pnl) });
+const position = (symbol, quantity, average, pnl = null, currency = "KRW") => ({ symbol, quantity: String(quantity),
+  average_price: String(average), unrealized_pnl: pnl == null ? null : String(pnl), currency });
 
 test("empty and sold positions show an empty ring and no tooltip", () => {
   const { chart, find } = fixture();
   chart.render([position("SOLD", 0, 120)], new Map());
-  assert.equal(find("#investment-total").textContent, "0");
+  assert.equal(find("#investment-total").textContent, "₩0");
   assert.equal(find(".investment-segments").children.length, 0);
   assert.equal(find(".investment-tooltip").hidden, true);
 });
@@ -70,27 +70,27 @@ test("empty and sold positions show an empty ring and no tooltip", () => {
 test("allocation uses remaining cost basis; one holding creates a complete ring", () => {
   const { chart, find } = fixture();
   chart.render([position("AAA", 2, 120000, 12000)], new Map([["AAA", "Company A"]]));
-  assert.equal(find("#investment-total").textContent, "240,000");
+  assert.equal(find("#investment-total").textContent, "₩240,000");
   const paths = find(".investment-segments").querySelectorAll("path");
   assert.equal(paths.length, 1);
   assert.equal((paths[0].attributes.d.match(/ A /g) || []).length, 4);
   assert.ok(!/NaN|Infinity/.test(paths[0].attributes.d));
   assert.match(paths[0].attributes["aria-label"], /100.0%/);
   chart.select({ target: paths[0], type: "pointerover", clientX: 350, clientY: 80 });
-  assert.equal(find("[data-investment-cost]").textContent, "240,000");
-  assert.equal(find("[data-investment-average]").textContent, "120,000");
-  assert.equal(find("[data-investment-pnl]").textContent, "+12,000 (+5.00%)");
+  assert.equal(find("[data-investment-cost]").textContent, "₩240,000");
+  assert.equal(find("[data-investment-average]").textContent, "₩120,000");
+  assert.equal(find("[data-investment-pnl]").textContent, "+₩12,000 (+5.00%)");
 });
 
 test("multiple stocks keep individual values and safe text names", () => {
   const { chart, find } = fixture();
   chart.render([position("AAA", 2, 100, -20), position("BBB", 6, 100)], new Map([["AAA", "<script>alert(1)</script>"]]));
-  assert.equal(find("#investment-total").textContent, "800");
+  assert.equal(find("#investment-total").textContent, "₩800");
   const path = find(".investment-segments").querySelectorAll("path").find((node) => node.dataset.investmentSymbol === "AAA");
   assert.match(path.attributes["aria-label"], /25.0%/);
   chart.select({ target: path, type: "focusin" });
   assert.equal(find("[data-investment-name]").textContent, "<script>alert(1)</script>");
-  assert.equal(find("[data-investment-pnl]").textContent, "-20 (-10.00%)");
+  assert.equal(find("[data-investment-pnl]").textContent, "-₩20 (-10.00%)");
   assert.equal(find("[data-investment-pnl]").classes.has("negative"), true);
   chart.show("BBB", null);
   assert.equal(find("[data-investment-pnl]").textContent, "-");
@@ -104,10 +104,24 @@ test("refresh updates the open tooltip without replacing unchanged slices", () =
   chart.select({ target: originalPath, type: "pointerover", clientX: 350, clientY: 80 });
   chart.render([position("AAA", 2, 100, -30)], new Map());
   assert.equal(find(".investment-segments").querySelectorAll("path")[0], originalPath);
-  assert.equal(find("[data-investment-pnl]").textContent, "-30 (-15.00%)");
+  assert.equal(find("[data-investment-pnl]").textContent, "-₩30 (-15.00%)");
   assert.equal(find(".investment-tooltip").hidden, false);
   chart.render([position("AAA", 0, 100, 0)], new Map());
   assert.equal(find(".investment-tooltip").hidden, true);
+});
+
+test("mixed KRW and USD holdings use FX for allocation and keep native tooltip amounts", () => {
+  const { chart, find } = fixture();
+  chart.render([
+    position("KR", 1, 1000, 100, "KRW"),
+    position("US", 1, 10, -0.001, "USD")
+  ], new Map(), new Map([["KRW", 1], ["USD", 100]]));
+  assert.equal(find("#investment-total").textContent, "₩2,000");
+  const path = find(".investment-segments").querySelectorAll("path").find((node) => node.dataset.investmentSymbol === "US");
+  assert.match(path.attributes["aria-label"], /50.0%/);
+  chart.select({ target: path, type: "focusin" });
+  assert.equal(find("[data-investment-cost]").textContent, "$10.00");
+  assert.equal(find("[data-investment-pnl]").textContent, "$0.00 (-0.01%)");
 });
 
 test("tap and keyboard tooltip fit a narrow chart and Escape dismisses it", () => {

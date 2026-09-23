@@ -11,7 +11,6 @@ class InvestmentChart {
     this.signature = null;
     this.activeSymbol = null;
     this.anchor = null;
-    this.format = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 });
     this.svg.addEventListener("pointerover", (event) => this.select(event));
     this.svg.addEventListener("pointermove", (event) => this.select(event));
     this.svg.addEventListener("pointerleave", () => {
@@ -48,6 +47,19 @@ class InvestmentChart {
     return element;
   }
 
+  amount(value, currency = "KRW", signed = false) {
+    if (!Number.isFinite(value)) return "-";
+    const digits = currency === "USD" ? 2 : 0;
+    const threshold = 0.5 * (10 ** -digits);
+    const normalized = Math.abs(value) < threshold ? 0 : value;
+    const sign = signed && normalized > 0 ? "+" : normalized < 0 ? "-" : "";
+    const prefix = currency === "USD" ? "$" : "₩";
+    return `${sign}${prefix}${Math.abs(normalized).toLocaleString("ko-KR", {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits
+    })}`;
+  }
+
   // Two arcs per edge also handle a single holding's complete 360-degree ring.
   arc(start, end) {
     const point = (radius, angle) => `${200 + radius * Math.cos(angle)},${200 + radius * Math.sin(angle)}`;
@@ -55,32 +67,44 @@ class InvestmentChart {
     return `M ${point(160, start)} A 160 160 0 0 1 ${point(160, middle)} A 160 160 0 0 1 ${point(160, end)} L ${point(104, end)} A 104 104 0 0 0 ${point(104, middle)} A 104 104 0 0 0 ${point(104, start)} Z`;
   }
 
-  render(positions, names) {
+  render(positions, names, fxRates = new Map([["KRW", 1]])) {
+    const missingCurrencies = new Set();
     const items = positions.map((position) => {
       const quantity = Number(position.quantity);
       const average = Number(position.average_price);
       const cost = quantity * average;
       const pnl = position.unrealized_pnl == null ? null : Number(position.unrealized_pnl);
+      const currency = position.currency === "KRW" || position.currency === "USD"
+        ? position.currency : /^\d{6}$/.test(String(position.symbol || "")) ? "KRW" : "USD";
+      const providedRate = Number(fxRates.get(currency));
+      const fxRate = Number.isFinite(providedRate) && providedRate > 0 ? providedRate : 1;
+      if (!(Number.isFinite(providedRate) && providedRate > 0)) missingCurrencies.add(currency);
       return { symbol: position.symbol, name: position.name || names.get(position.symbol) || position.symbol,
-        quantity, average, cost, pnl: Number.isFinite(pnl) ? pnl : null };
-    }).filter((item) => item.quantity > 0 && Number.isFinite(item.cost) && item.cost > 0)
-      .sort((a, b) => b.cost - a.cost || a.symbol.localeCompare(b.symbol));
-    const total = items.reduce((sum, item) => sum + item.cost, 0);
+        quantity, average, cost, currency, convertedCost: cost * fxRate,
+        pnl: Number.isFinite(pnl) ? pnl : null };
+    }).filter((item) => item.quantity > 0 && Number.isFinite(item.convertedCost) && item.convertedCost > 0)
+      .sort((a, b) => b.convertedCost - a.convertedCost || a.symbol.localeCompare(b.symbol));
+    const total = items.reduce((sum, item) => sum + item.convertedCost, 0);
     this.positions = new Map(items.map((item) => [item.symbol, item]));
-    this.root.querySelector("#investment-total").textContent = this.format.format(total);
+    this.root.querySelector("#investment-total").textContent = this.amount(total);
     this.root.querySelector("#investment-count").textContent = `${items.length}개 종목`;
+    const hasMixedCurrencies = new Set(items.map((item) => item.currency)).size > 1;
     this.root.querySelector("#investment-help").textContent = items.length
-      ? "평균매수가 × 보유 수량 기준 · 차트에 마우스를 올리거나 눌러 투자 정보를 확인하세요."
+      ? missingCurrencies.size
+        ? "환율을 불러오지 못해 통화별 투자금액을 단순 비교 중입니다."
+        : hasMixedCurrencies
+          ? "평균매수가 × 보유 수량 기준 · 해외주식은 현재 USD/KRW 환율로 환산했습니다."
+          : "평균매수가 × 보유 수량 기준 · 차트에서 종목별 투자 정보를 확인하세요."
       : "보유 종목이 없습니다. 매수가 체결되면 투자 현황이 표시됩니다.";
 
-    const signature = JSON.stringify(items.map(({ symbol, name, cost }) => [symbol, name, cost]));
+    const signature = JSON.stringify(items.map(({ symbol, name, convertedCost }) => [symbol, name, convertedCost]));
     if (signature !== this.signature) {
       const focusedSymbol = this.svg.contains(document.activeElement)
         ? document.activeElement.dataset.investmentSymbol : null;
       const fragment = document.createDocumentFragment();
       let start = -Math.PI / 2;
       for (const item of items) {
-        const share = item.cost / total;
+        const share = item.convertedCost / total;
         const end = start + share * Math.PI * 2;
         const path = this.node("path", { d: this.arc(start, end), fill: this.color(item.symbol),
           class: "investment-slice", "data-investment-symbol": item.symbol, tabindex: "0", role: "button",
@@ -131,10 +155,10 @@ class InvestmentChart {
     const set = (selector, value) => { this.tooltip.querySelector(selector).textContent = value; };
     set("[data-investment-name]", item.name);
     set("[data-investment-symbol-label]", item.symbol);
-    set("[data-investment-cost]", this.format.format(item.cost));
-    set("[data-investment-average]", this.format.format(item.average));
+    set("[data-investment-cost]", this.amount(item.cost, item.currency));
+    set("[data-investment-average]", this.amount(item.average, item.currency));
     const pnlText = item.pnl == null ? "-"
-      : `${item.pnl > 0 ? "+" : ""}${this.format.format(item.pnl)} (${item.pnl > 0 ? "+" : ""}${(item.pnl / item.cost * 100).toFixed(2)}%)`;
+      : `${this.amount(item.pnl, item.currency, true)} (${item.pnl > 0 ? "+" : item.pnl < 0 ? "-" : ""}${Math.abs(item.pnl / item.cost * 100).toFixed(2)}%)`;
     set("[data-investment-pnl]", pnlText);
     const pnlNode = this.tooltip.querySelector("[data-investment-pnl]");
     pnlNode.classList.toggle("positive", item.pnl > 0);

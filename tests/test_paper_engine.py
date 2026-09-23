@@ -25,6 +25,22 @@ class PaperEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ticks[0]["symbol"], "005930")
         self.assertEqual(ticks[0]["name"], "삼성전자")
+        self.assertEqual(ticks[0]["currency"], "KRW")
+
+    async def test_position_snapshot_includes_currency_return_and_quote_time(self) -> None:
+        quote_time = datetime(2026, 9, 23, 7, 30, tzinfo=timezone.utc)
+        await self.engine.update_tick(TickRequest(symbol="AAPL", name="Apple", price=Decimal("100"), currency="USD"))
+        await self.engine.place_order(OrderRequest(symbol="AAPL", side=OrderSide.BUY, quantity=Decimal("2")))
+        await self.engine.update_tick(TickRequest(symbol="AAPL", name="Apple", price=Decimal("110"), currency="USD", timestamp=quote_time))
+
+        position = (await self.engine.positions_snapshot())[0]
+
+        self.assertEqual(position["name"], "Apple")
+        self.assertEqual(position["currency"], "USD")
+        self.assertEqual(position["price_updated_at"], quote_time)
+        self.assertEqual(position["cost_basis"], Decimal("200.00000000"))
+        self.assertEqual(position["unrealized_pnl"], Decimal("20.00000000"))
+        self.assertEqual(position["unrealized_return"], Decimal("0.10000000"))
 
     async def asyncSetUp(self) -> None:
         self.engine = PaperEngine(
