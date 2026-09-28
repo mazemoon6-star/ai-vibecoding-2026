@@ -14,7 +14,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_FLOOR
 from typing import Any
 from uuid import uuid4
 
@@ -23,6 +23,8 @@ from .paper_state import PaperStateStore, StateStoreError, dump_engine, restore_
 from .models import (
     AUTO_STRATEGY_LONG_WINDOW,
     AUTO_STRATEGY_SHORT_WINDOW,
+    AutoDiscoveryConfig,
+    AutoDiscoveryRequest,
     AutoStrategySettings,
     AutoStrategySymbolRequest,
     ExecutionMode,
@@ -103,7 +105,9 @@ class Strategy:
     order_quantity: Decimal
     max_position: Decimal | None
     enabled: bool
+    entry_enabled: bool = True
     previous_relation: int | None = None
+    investment_budget: Decimal | None = None
 
 
 class PaperEngine:
@@ -111,7 +115,7 @@ class PaperEngine:
 
     def __init__(
         self,
-        initial_cash: Decimal = Decimal("1000000"),
+        initial_cash: Decimal = Decimal("10000000"),
         fee_rate: Decimal = Decimal("0.00015"),
         slippage_rate: Decimal = Decimal("0"),
         history_size: int = 2_000,
@@ -145,6 +149,7 @@ class PaperEngine:
         self.auto_watchlist: dict[str, datetime] = {}
         self.auto_strategy_ids: dict[str, str] = {}
         self.auto_strategy_settings: dict[str, AutoStrategySettings] = {}
+        self.auto_discovery = AutoDiscoveryConfig()
         self.reserved_cash = Decimal("0")
         self.reserved_sell_quantity: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
         self.realized_pnl = Decimal("0")
@@ -168,6 +173,22 @@ class PaperEngine:
         except BaseException:
             store.close()
             raise
+
+    async def configure_untraded_initial_cash(self, initial_cash: Decimal) -> None:
+        """Apply starting capital only while the saved account has never traded."""
+        if not initial_cash.is_finite() or initial_cash <= 0:
+            raise ValueError("initial_cash must be a finite positive decimal")
+        async with self._mutation():
+            if (
+                self.orders or self.positions
+                or self.cash != self.initial_cash
+                or self.reserved_cash != 0
+                or self.realized_pnl != 0
+                or self.realized_pnl_before_fees != 0
+            ):
+                return
+            self.initial_cash = initial_cash
+            self.cash = initial_cash
 
     async def enforce_fixed_auto_windows(self) -> None:
         """Migrate persisted automatic strategies to the analyzed fixed windows."""
@@ -231,6 +252,8 @@ class PaperEngine:
 
             filled_orders: list[dict[str, Any]] = []
             for order in list(self.orders.values()):
+                if not self.trading_enabled or self.kill_switch:
+                    break
                 if order.symbol != tick.symbol or order.status is not OrderStatus.PENDING:
                     continue
                 if self._can_fill(order, tick):
@@ -294,6 +317,12 @@ class PaperEngine:
                 estimate = order.price
             assert estimate is not None
             required = self._money(estimate * order.quantity * (Decimal("1") + self.fee_rate))
+            strategy = self.strategies.get(order.strategy_id or "")
+            if strategy is not None and strategy.investment_budget is not None:
+                if order.symbol != strategy.symbol or not strategy.entry_enabled:
+                    raise EngineError("invalid_budget_order", "현재 배분 대상 종목의 매수 주문만 가능합니다.", 409)
+                if required > self._budget_remaining_unlocked(strategy):
+                    raise EngineError("investment_budget_exceeded", "종목별 또는 총 투자금 한도를 초과합니다.", 422)
             if required > self.available_cash:
                 raise EngineError("insufficient_cash", "not enough available paper cash", 422)
             order.reserved_cash = required
@@ -459,9 +488,14 @@ class PaperEngine:
             action = StrategyAction.BUY
             reason = "moving_average_cross_up"
             target_quantity = strategy.order_quantity
-            if strategy.max_position is not None:
+            if strategy.investment_budget is not None:
+                target_quantity = self._budget_order_plan_unlocked(strategy)["quantity"]
+            elif strategy.max_position is not None:
                 target_quantity = min(target_quantity, strategy.max_position - position.quantity)
-            if target_quantity > 0 and not self._has_pending_strategy_order(strategy.strategy_id):
+            if not strategy.entry_enabled:
+                action = StrategyAction.HOLD
+                reason = "not_selected_for_entry"
+            elif target_quantity > 0 and not self._has_pending_strategy_order(strategy.strategy_id):
                 try:
                     order = self._place_order_unlocked(
                         OrderRequest(
@@ -474,10 +508,15 @@ class PaperEngine:
                     )
                 except EngineError as exc:
                     reason = f"order_rejected:{exc.code}"
+            elif target_quantity <= 0 and strategy.investment_budget is not None:
+                action = StrategyAction.HOLD
+                reason = "investment_budget_exhausted"
         elif previous is not None and previous >= 0 > relation:
             action = StrategyAction.SELL
             reason = "moving_average_cross_down"
             target_quantity = min(strategy.order_quantity, position.quantity)
+            if strategy.investment_budget is not None:
+                target_quantity = self.available_sell_quantity(strategy.symbol)
             if target_quantity > 0 and not self._has_pending_strategy_order(strategy.strategy_id):
                 try:
                     order = self._place_order_unlocked(
@@ -510,17 +549,20 @@ class PaperEngine:
 
     async def pause(self) -> dict[str, Any]:
         async with self._mutation():
+            self.auto_discovery.revision += 1
             self.trading_enabled = False
             return self.control_state("paper trading paused")
 
     async def resume(self) -> dict[str, Any]:
         async with self._mutation():
+            self.auto_discovery.revision += 1
             self.kill_switch = False
             self.trading_enabled = True
             return self.control_state("paper trading resumed")
 
     async def kill(self) -> dict[str, Any]:
         async with self._mutation():
+            self.auto_discovery.revision += 1
             self.kill_switch = True
             self.trading_enabled = False
             return self.control_state("kill switch enabled")
@@ -657,40 +699,228 @@ class PaperEngine:
         settings_by_symbol = settings_by_symbol or {}
         async with self._mutation():
             for symbol in self.auto_watchlist:
+                current = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
                 settings = settings_by_symbol.get(
                     symbol,
                     self.auto_strategy_settings.get(symbol, AutoStrategySettings()),
                 )
-                self.auto_strategy_settings[symbol] = settings
-                strategy_id = self.auto_strategy_ids.get(symbol)
-                strategy = self.strategies.get(strategy_id or "")
-                if strategy is None:
-                    strategy = Strategy(
-                        strategy_id=f"auto-{uuid4().hex[:12]}",
-                        name=f"auto-{symbol}",
-                        symbol=symbol,
-                        short_window=settings.short_window,
-                        long_window=settings.long_window,
-                        order_quantity=settings.order_quantity,
-                        max_position=settings.order_quantity,
-                        enabled=True,
-                    )
-                    self.strategies[strategy.strategy_id] = strategy
-                    self.auto_strategy_ids[symbol] = strategy.strategy_id
-                else:
-                    parameters_changed = (
-                        strategy.short_window != settings.short_window
-                        or strategy.long_window != settings.long_window
-                        or strategy.order_quantity != settings.order_quantity
-                    )
-                    strategy.short_window = settings.short_window
-                    strategy.long_window = settings.long_window
-                    strategy.order_quantity = settings.order_quantity
-                    strategy.max_position = settings.order_quantity
-                    strategy.enabled = True
-                    if parameters_changed:
-                        strategy.previous_relation = None
+                entry_enabled = current.entry_enabled if current is not None else True
+                if symbol in self.auto_discovery.managed_symbols:
+                    settings = self.auto_strategy_settings.get(symbol, settings)
+                self._activate_auto_strategy_unlocked(symbol, settings, entry_enabled=entry_enabled)
             return [self._auto_watchlist_dict(symbol) for symbol in self.auto_watchlist]
+
+    def _activate_auto_strategy_unlocked(
+        self, symbol: str, settings: AutoStrategySettings, *, entry_enabled: bool = True
+    ) -> None:
+        self.auto_strategy_settings[symbol] = settings
+        strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+        if strategy is None:
+            strategy = Strategy(
+                strategy_id=f"auto-{uuid4().hex[:12]}",
+                name=f"auto-{symbol}",
+                symbol=symbol,
+                short_window=settings.short_window,
+                long_window=settings.long_window,
+                order_quantity=settings.order_quantity,
+                max_position=settings.order_quantity,
+                enabled=True,
+                entry_enabled=entry_enabled,
+            )
+            self.strategies[strategy.strategy_id] = strategy
+            self.auto_strategy_ids[symbol] = strategy.strategy_id
+        else:
+            parameters_changed = (
+                strategy.short_window != settings.short_window
+                or strategy.long_window != settings.long_window
+                or strategy.order_quantity != settings.order_quantity
+            )
+            strategy.short_window = settings.short_window
+            strategy.long_window = settings.long_window
+            strategy.order_quantity = settings.order_quantity
+            strategy.max_position = None if strategy.investment_budget is not None else settings.order_quantity
+            strategy.enabled = True
+            strategy.entry_enabled = entry_enabled
+            if parameters_changed:
+                strategy.previous_relation = None
+
+    def _position_investment_unlocked(self, symbol: str) -> Decimal:
+        position = self.positions.get(symbol)
+        if position is None or position.quantity <= 0:
+            return Decimal("0")
+        return self._money(position.quantity * position.average_price + position.remaining_buy_fees)
+
+    def _committed_investment_unlocked(self, symbols: set[str]) -> Decimal:
+        holdings = sum((self._position_investment_unlocked(symbol) for symbol in symbols), Decimal("0"))
+        pending = sum((
+            order.reserved_cash for order in self.orders.values()
+            if order.symbol in symbols and order.side is OrderSide.BUY and order.status is OrderStatus.PENDING
+        ), Decimal("0"))
+        return holdings + pending
+
+    def _budget_remaining_unlocked(self, strategy: Strategy) -> Decimal:
+        if strategy.investment_budget is None or self.auto_discovery.total_investment is None:
+            return Decimal("0")
+        symbol_remaining = strategy.investment_budget - self._committed_investment_unlocked({strategy.symbol})
+        managed = set(self.auto_discovery.managed_symbols) | {strategy.symbol}
+        total_remaining = self.auto_discovery.total_investment - self._committed_investment_unlocked(managed)
+        return max(Decimal("0"), min(symbol_remaining, total_remaining, self.available_cash))
+
+    def _budget_order_plan_unlocked(
+        self, strategy: Strategy, *, available_budget: Decimal | None = None
+    ) -> dict[str, Decimal]:
+        """Use the same price, fee rounding and cash limits as PAPER execution."""
+        remaining = self._budget_remaining_unlocked(strategy)
+        if available_budget is not None:
+            remaining = min(remaining, max(Decimal("0"), available_budget))
+        tick = self.ticks.get(strategy.symbol)
+        if tick is None:
+            return {"quantity": Decimal("0"), "price": Decimal("0"), "fee": Decimal("0"),
+                    "estimated_total": Decimal("0"), "remaining": remaining}
+        price = self._market_price(OrderSide.BUY, tick)
+        if price <= 0:
+            return {"quantity": Decimal("0"), "price": price, "fee": Decimal("0"),
+                    "estimated_total": Decimal("0"), "remaining": remaining}
+        quantity = (remaining / (price * (Decimal("1") + self.fee_rate))).to_integral_value(rounding=ROUND_FLOOR)
+        if not strategy.entry_enabled or (tick.currency or instrument_currency(strategy.symbol)) != "KRW":
+            quantity = Decimal("0")
+        notional = self._money(price * quantity)
+        fee = self._money(notional * self.fee_rate)
+        if quantity > 0 and notional + fee > remaining:
+            quantity -= 1
+            notional = self._money(price * quantity)
+            fee = self._money(notional * self.fee_rate)
+        return {"quantity": quantity, "price": price, "fee": fee,
+                "estimated_total": notional + fee, "remaining": remaining}
+
+    async def auto_allocation_snapshot(self) -> dict[str, Any] | None:
+        async with self.lock:
+            total = self.auto_discovery.total_investment
+            if total is None:
+                return None
+            managed = set(self.auto_discovery.managed_symbols)
+            committed = self._committed_investment_unlocked(managed)
+            preview_remaining = max(Decimal("0"), min(total - committed, self.available_cash))
+            items = []
+            retiring_cost = Decimal("0")
+            for symbol in self.auto_discovery.managed_symbols:
+                strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+                if strategy is None or not strategy.entry_enabled:
+                    retiring_cost += self._committed_investment_unlocked({symbol})
+                    continue
+                if strategy.investment_budget is None:
+                    continue
+                plan = self._budget_order_plan_unlocked(strategy, available_budget=preview_remaining)
+                preview_remaining -= plan["estimated_total"]
+                tick = self.ticks.get(symbol)
+                items.append({
+                    "symbol": symbol, "name": tick.name if tick else instrument_name(symbol),
+                    "budget": strategy.investment_budget,
+                    "committed": self._committed_investment_unlocked({symbol}),
+                    "estimated_quantity": plan["quantity"], "estimated_price": plan["price"],
+                    "estimated_fee": plan["fee"], "estimated_total": plan["estimated_total"],
+                    "remaining": plan["remaining"],
+                })
+            return {
+                "currency": "KRW", "total_investment": total, "committed": committed,
+                "retiring_committed": retiring_cost,
+                "available_for_investment": max(Decimal("0"), min(total - committed, self.available_cash)),
+                "fee_rate": self.fee_rate, "slippage_rate": self.slippage_rate, "items": items,
+            }
+
+    async def apply_auto_discovery_selection(
+        self,
+        request: AutoDiscoveryRequest,
+        symbols: list[str],
+        *,
+        expected_revision: int,
+        start: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Commit selection and strategy changes together after quotes are available."""
+        selected = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
+        async with self._mutation():
+            if self.auto_discovery.revision != expected_revision:
+                raise EngineError("discovery_interrupted", "운영 설정이 변경되어 진행 중인 자동 발굴을 취소했습니다.", 409)
+            if not start and (not self.auto_discovery.enabled or not self.trading_enabled):
+                raise EngineError("discovery_interrupted", "자동 발굴이 정지되었습니다.", 409)
+            if not selected or len(selected) > request.max_symbols:
+                raise EngineError("invalid_selection", "자동 선정 종목 수가 올바르지 않습니다.", 422)
+            if any(symbol not in self.ticks for symbol in selected):
+                raise EngineError("price_unavailable", "선정 종목의 현재가를 확보하지 못했습니다.", 409)
+
+            per_symbol_budget = None
+            if request.total_investment is not None:
+                managed = set(self.auto_discovery.managed_symbols) | set(selected)
+                held = {symbol for symbol in managed if self.positions.get(symbol, Position(symbol)).quantity > 0}
+                if any(
+                    (self.ticks[symbol].currency or instrument_currency(symbol)) != "KRW"
+                    for symbol in set(selected) | held if symbol in self.ticks
+                ) or any(instrument_currency(symbol) != "KRW" for symbol in held if symbol not in self.ticks):
+                    raise EngineError("budget_currency_mismatch", "원화 배분 대상에는 원화 종목만 포함할 수 있습니다.", 422)
+                capacity = self.available_cash + sum((self._position_investment_unlocked(symbol) for symbol in held), Decimal("0"))
+                if start and request.total_investment > capacity:
+                    raise EngineError("insufficient_investment_cash", "총 투자금액은 가용현금과 기존 배분 대상 보유금액의 합 이하여야 합니다.", 422)
+                retiring_cost = sum(
+                    (self._position_investment_unlocked(symbol) for symbol in held - set(selected)), Decimal("0")
+                )
+                distributable = max(Decimal("0"), min(request.total_investment, capacity) - retiring_cost)
+                per_symbol_budget = (distributable / len(selected)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+            retiring = []
+            for symbol in self.auto_discovery.managed_symbols:
+                if symbol in selected:
+                    continue
+                strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+                position = self.positions.get(symbol)
+                if position is not None and position.quantity > 0:
+                    retiring.append(symbol)
+                    self.auto_watchlist.setdefault(symbol, utc_now())
+                    settings = self.auto_strategy_settings.get(symbol, AutoStrategySettings())
+                    self._activate_auto_strategy_unlocked(symbol, settings, entry_enabled=False)
+                else:
+                    self.auto_watchlist.pop(symbol, None)
+                    self.auto_strategy_settings.pop(symbol, None)
+                    if strategy is not None:
+                        strategy.enabled = False
+                # An excluded symbol must never fill a previously queued entry.
+                for order in self.orders.values():
+                    if (order.symbol == symbol and order.side is OrderSide.BUY
+                            and order.strategy_id == self.auto_strategy_ids.get(symbol)
+                            and order.status is OrderStatus.PENDING):
+                        self._release_reservation(order)
+                        order.status = OrderStatus.CANCELED
+                        order.updated_at = utc_now()
+                        self.metrics["orders_canceled"] += 1
+
+            for symbol in selected:
+                self.auto_watchlist.setdefault(symbol, utc_now())
+                self._activate_auto_strategy_unlocked(
+                    symbol, AutoStrategySettings(order_quantity=request.order_quantity)
+                )
+                strategy = self.strategies[self.auto_strategy_ids[symbol]]
+                strategy.investment_budget = per_symbol_budget
+                strategy.max_position = None if per_symbol_budget is not None else request.order_quantity
+            self.auto_discovery = AutoDiscoveryConfig(
+                **request.model_dump(),
+                enabled=True,
+                revision=expected_revision + 1,
+                managed_symbols=selected + retiring,
+            )
+            if start:
+                self.kill_switch = False
+                self.trading_enabled = True
+            return [self._auto_watchlist_dict(symbol) for symbol in self.auto_discovery.managed_symbols]
+
+    async def stop_auto_discovery(self) -> dict[str, Any]:
+        async with self._mutation():
+            self.auto_discovery.enabled = False
+            self.auto_discovery.revision += 1
+            self.trading_enabled = False
+            return self.auto_discovery.model_dump(mode="json")
+
+    async def auto_discovery_snapshot(self) -> dict[str, Any]:
+        async with self.lock:
+            return self.auto_discovery.model_dump(mode="json")
 
     async def auto_strategy_symbols(self) -> list[str]:
         async with self.lock:
@@ -711,7 +941,17 @@ class PaperEngine:
             "symbol": symbol,
             "name": tick.name if tick else instrument_name(symbol),
             "added_at": self.auto_watchlist[symbol],
-            "status": "운영 중" if strategy is not None and strategy.enabled else "대기 중",
+            "status": (
+                "일시 정지" if strategy is not None and strategy.enabled and not self.trading_enabled
+                else
+                "보유 포지션 정리 중"
+                if strategy is not None and strategy.enabled and not strategy.entry_enabled
+                else "시세 수집 중"
+                if strategy is not None and strategy.enabled and len(self.price_history[symbol]) < strategy.long_window
+                else "운영 중" if strategy is not None and strategy.enabled else "대기 중"
+            ),
+            "managed": symbol in self.auto_discovery.managed_symbols,
+            "entry_enabled": strategy.entry_enabled if strategy else True,
             "strategy_id": strategy.strategy_id if strategy is not None else None,
             "short_window": short_window,
             "long_window": long_window,
@@ -807,8 +1047,11 @@ class PaperEngine:
             "short_window": strategy.short_window,
             "long_window": strategy.long_window,
             "order_quantity": strategy.order_quantity,
+            "investment_budget": strategy.investment_budget,
+            "sizing_mode": "equal_budget" if strategy.investment_budget is not None else "fixed_quantity",
             "max_position": strategy.max_position,
             "enabled": strategy.enabled,
+            "entry_enabled": strategy.entry_enabled,
             "previous_relation": strategy.previous_relation,
         }
 

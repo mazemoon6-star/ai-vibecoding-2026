@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import get_args, get_type_hints
 
-from .models import AutoStrategySettings, OrderSide, OrderStatus, utc_now
+from .models import AutoDiscoveryConfig, AutoStrategySettings, OrderSide, OrderStatus, utc_now
 
 
 class StateStoreError(RuntimeError):
@@ -126,6 +126,7 @@ def dump_engine(engine):
     for key in ("client_orders", "auto_watchlist", "auto_strategy_ids", "reserved_sell_quantity", "metrics"):
         state[key] = dict(getattr(engine, key))
     state["auto_strategy_settings"] = {symbol: settings.model_dump(mode="json") for symbol, settings in engine.auto_strategy_settings.items()}
+    state["auto_discovery"] = engine.auto_discovery.model_dump(mode="json")
     return json.loads(json.dumps(state, default=json_value, allow_nan=False))
 
 
@@ -182,6 +183,7 @@ def restore_engine(engine, state):
     values["auto_watchlist"] = {symbol: datetime.fromisoformat(added) for symbol, added in state["auto_watchlist"].items()}
     values["auto_strategy_ids"] = dict(state["auto_strategy_ids"])
     values["auto_strategy_settings"] = {symbol: AutoStrategySettings.model_validate(item) for symbol, item in state["auto_strategy_settings"].items()}
+    values["auto_discovery"] = AutoDiscoveryConfig.model_validate(state.get("auto_discovery", {}))
     values["reserved_sell_quantity"] = defaultdict(lambda: Decimal("0"), {symbol: Decimal(amount) for symbol, amount in state["reserved_sell_quantity"].items()})
     values["metrics"] = defaultdict(int, state["metrics"])
     pending = [order for order in values["orders"].values() if order.status is OrderStatus.PENDING]

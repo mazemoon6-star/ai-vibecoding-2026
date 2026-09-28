@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from auto_trader.migrate_paper_state import migrate_snapshot
-from auto_trader.models import AutoStrategySettings, AutoStrategySymbolRequest, OrderRequest, TickRequest
+from auto_trader.models import AutoDiscoveryRequest, AutoStrategySettings, AutoStrategySymbolRequest, OrderRequest, TickRequest
 from auto_trader.paper_engine import EngineError, PaperEngine
 from auto_trader.paper_state import StateStoreError, dump_engine, json_value, restore_engine
 
@@ -71,6 +71,25 @@ class PaperStateTests(unittest.IsolatedAsyncioTestCase):
         engine.close_persistence()
         self.assertEqual(dump_engine(self.persistent_engine()), before)
 
+    async def test_starting_cash_updates_untraded_saved_account_but_never_resets_trades(self):
+        original = PaperEngine(initial_cash=Decimal("1000000"))
+        original.enable_persistence(self.path)
+        original.close_persistence()
+        engine = self.persistent_engine()
+        await engine.configure_untraded_initial_cash(Decimal("10000000"))
+        self.assertEqual((await engine.account())["available_cash"], Decimal("10000000"))
+        engine.close_persistence()
+        restored = self.persistent_engine()
+        self.assertEqual(restored.initial_cash, Decimal("10000000"))
+        self.assertEqual(restored.cash, Decimal("10000000"))
+        await restored.update_tick(TickRequest(symbol="TEST", price=100))
+        await restored.place_order(OrderRequest(symbol="TEST", side="BUY", quantity=2))
+        before = dump_engine(restored)
+        await restored.configure_untraded_initial_cash(Decimal("20000000"))
+        self.assertEqual(dump_engine(restored), before)
+        restored.close_persistence()
+        self.assertEqual(dump_engine(self.persistent_engine()), before)
+
     async def test_corrupt_state_is_not_replaced_by_a_new_account(self):
         engine = self.persistent_engine()
         await engine.update_tick(TickRequest(symbol="TEST", price=100))
@@ -82,6 +101,23 @@ class PaperStateTests(unittest.IsolatedAsyncioTestCase):
             PaperEngine().enable_persistence(self.path)
         with closing(sqlite3.connect(self.path)) as connection:
             self.assertEqual(connection.execute("SELECT payload FROM paper_state").fetchone()[0], "{}")
+
+    async def test_discovery_selection_commit_failure_restores_watchlist_and_entry_flags(self):
+        engine = self.persistent_engine()
+        for symbol in ("OLD", "NEW"):
+            await engine.update_tick(TickRequest(symbol=symbol, price=100))
+        request = AutoDiscoveryRequest(keyword="냉각", max_symbols=1, order_quantity=2)
+        await engine.apply_auto_discovery_selection(request, ["OLD"], expected_revision=0, start=True)
+        await engine.place_order(OrderRequest(symbol="OLD", side="BUY", quantity=2))
+        before = dump_engine(engine)
+        with patch.object(engine.state_store, "save", side_effect=StateStoreError("disk full")):
+            with self.assertRaises(EngineError):
+                await engine.apply_auto_discovery_selection(
+                    request, ["NEW"], expected_revision=engine.auto_discovery.revision
+                )
+        self.assertEqual(dump_engine(engine), before)
+        engine.close_persistence()
+        self.assertEqual(dump_engine(self.persistent_engine()), before)
 
     async def test_second_server_cannot_overwrite_the_same_account(self):
         self.persistent_engine()

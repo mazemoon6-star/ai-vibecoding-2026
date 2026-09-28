@@ -2,7 +2,8 @@ const $ = (selector) => document.querySelector(selector);
 const notice = $("#notice");
 let noticeTimer;
 let queuedAutoTradeSymbols = new Set();
-const autoStrategyDrafts = new Map();
+let autoDiscoveryDraft = false;
+let autoDiscoveryBusy = false;
 const investmentChart = new InvestmentChart($("#investment-card"));
 
 function esc(value) {
@@ -37,14 +38,6 @@ function positionCurrency(position) {
   return /^\d{6}$/.test(String(position.symbol || "")) ? "KRW" : "USD";
 }
 
-function percent(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
-  const percentage = Math.abs(number * 100) < 0.005 ? 0 : number * 100;
-  const formatted = Math.abs(percentage).toLocaleString("ko-KR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return `${percentage > 0 ? "+" : percentage < 0 ? "-" : ""}${formatted}%`;
-}
-
 function date(value, omitSeconds = false) {
   if (!value) return "-";
   const parsed = new Date(value);
@@ -72,17 +65,80 @@ function show(message, isError = false, source = "action") {
   if (!isError) noticeTimer = setTimeout(() => { notice.hidden = true; }, 5000);
 }
 
-function rows(target, values, template, empty = "데이터가 없습니다.") {
-  target.innerHTML = values.length ? values.map(template).join("") : `<tr><td class="empty" colspan="8">${empty}</td></tr>`;
+function renderAutoDiscovery(discovery, items, configured) {
+  if (!autoDiscoveryDraft && !autoDiscoveryBusy) {
+    if (discovery.keyword) $("#auto-discovery-keyword").value = discovery.keyword;
+    $("#auto-discovery-market").value = discovery.market;
+    $("#auto-discovery-count").value = String(discovery.max_symbols);
+    $("#auto-discovery-quantity").value = discovery.order_quantity;
+    $("#auto-discovery-sizing").value = discovery.total_investment != null || !discovery.keyword ? "budget" : "quantity";
+    if (discovery.total_investment != null) $("#auto-discovery-budget").value = discovery.total_investment;
+    updateInvestmentMode();
+  }
+  const state = $("#auto-discovery-state");
+  const running = discovery.enabled && discovery.trading_enabled;
+  state.textContent = discovery.scanning ? "종목 발굴 중" : !discovery.enabled
+    ? "자동 발굴 꺼짐" : running ? "자동 발굴·매매 중" : "자동매매 일시 정지";
+  state.classList.toggle("badge", running);
+  state.classList.toggle("pill", !running);
+  const names = new Map(items.map((item) => [item.symbol, item.name || item.symbol]));
+  const selected = (discovery.selected_symbols || []).map((symbol) => names.get(symbol) || symbol);
+  const retiring = (discovery.retiring_symbols || []).map((symbol) => names.get(symbol) || symbol);
+  const parts = [];
+  if (!configured) parts.push("토스 시세 연동을 설정하고 서버를 다시 시작하면 자동 발굴을 사용할 수 있습니다.");
+  if (selected.length) parts.push("선정 종목: " + selected.join(", "));
+  if (retiring.length) parts.push("신규 매수 중단·매도 신호 감시: " + retiring.join(", "));
+  if (discovery.last_scan_at) parts.push("최근 선정: " + date(discovery.last_scan_at));
+  if (discovery.error) parts.push("발굴 오류: " + discovery.error);
+  if (discovery.enabled && !discovery.trading_enabled) parts.push("자동 발굴·매매 시작을 누르면 자동화를 이어갑니다.");
+  $("#auto-discovery-summary").textContent = parts.join(" · ")
+    || "시작 후 자동 선정된 종목의 시세를 수집하고, 이평선 교차 신호가 발생하면 PAPER 주문을 실행합니다.";
+  $("#auto-discovery-summary").classList.toggle("error", Boolean(discovery.error));
+  $("#auto-discovery-start").disabled = autoDiscoveryBusy || discovery.scanning || !configured;
+  $("#auto-discovery-stop").disabled = !autoDiscoveryBusy && !discovery.scanning && !discovery.enabled;
+  renderAllocation(discovery.allocation);
+}
+
+function updateInvestmentMode() {
+  const budgetMode = $("#auto-discovery-sizing").value === "budget";
+  $("#auto-discovery-budget-field").hidden = !budgetMode;
+  $("#auto-discovery-budget").disabled = !budgetMode;
+  $("#auto-discovery-budget").required = budgetMode;
+  $("#auto-discovery-quantity-field").hidden = budgetMode;
+  $("#auto-discovery-quantity").disabled = budgetMode;
+  $("#auto-discovery-quantity").required = !budgetMode;
+  $("#auto-discovery-budget-help").textContent = budgetMode
+    ? "금액 배분은 국내 주식 기준입니다. 기존 보유금액과 매수 수수료도 투자 한도에 포함하며, 1주를 살 수 없는 잔액은 현금으로 남깁니다."
+    : "각 종목에 입력한 동일 수량을 적용합니다. 미국 주식은 현재 수량 지정 방식으로 이용할 수 있습니다.";
+}
+
+function renderAllocation(allocation) {
+  $("#allocation-preview").hidden = !allocation;
+  if (!allocation) return;
+  const parts = [
+    "적용된 총 투자 한도 " + currencyMoney(allocation.total_investment),
+    "기존 보유·매수 예약 " + currencyMoney(allocation.committed),
+    "추가 투자 가능 " + currencyMoney(allocation.available_for_investment)
+  ];
+  if (Number(allocation.retiring_committed) > 0) {
+    parts.push("선정 제외 보유분 " + currencyMoney(allocation.retiring_committed) + "은 배분에서 차감");
+  }
+  $("#allocation-summary").textContent = parts.join(" · ");
+  $("#allocation-body").innerHTML = allocation.items.map((item) =>
+    '<tr><td><strong>' + esc(item.name) + '</strong><small class="volume-symbol">' + esc(item.symbol)
+    + '</small></td><td>' + currencyMoney(item.budget) + '</td><td>'
+    + money(item.estimated_quantity, 0) + '주</td><td>' + currencyMoney(item.estimated_total) + '</td></tr>'
+  ).join("");
 }
 
 async function refresh() {
   try {
-    const [account, positions, strategies, broker, autoSymbols, exchangeRate] = await Promise.all([
+    const [account, positions, broker, autoSymbols, exchangeRate, discovery] = await Promise.all([
       api("/api/v1/account"), api("/api/v1/positions"),
-      api("/api/v1/strategies"), api("/api/v1/broker/status"),
+      api("/api/v1/broker/status"),
       api("/api/v1/auto-trade-symbols"),
-      api("/api/v1/market/exchange-rate").catch(() => null)
+      api("/api/v1/market/exchange-rate").catch(() => null),
+      api("/api/v1/auto-discovery")
     ]);
     const a = account;
     const hasUsdPositions = positions.items.some((position) => positionCurrency(position) === "USD" && Number(position.quantity) > 0);
@@ -99,45 +155,13 @@ async function refresh() {
     $("#broker-badge").textContent = configured ? "토스 시세 연동 준비됨" : "토스 시세 미설정";
     $("#broker-badge").classList.toggle("muted", !configured);
     queuedAutoTradeSymbols = new Set(autoSymbols.items.map((item) => item.symbol));
-    const heldQuantities = new Map(positions.items
-      .filter((position) => Number(position.quantity) > 0)
-      .map((position) => [position.symbol, position.quantity]));
+    renderAutoDiscovery(discovery, autoSymbols.items, configured);
     const stockNames = new Map(autoSymbols.items.map((item) => [item.symbol, item.name || item.symbol]));
     const fxRates = new Map([["KRW", 1]]);
     if (exchangeRate?.baseCurrency === "USD" && exchangeRate?.quoteCurrency === "KRW" && Number(exchangeRate.rate) > 0) {
       fxRates.set("USD", Number(exchangeRate.rate));
     }
     investmentChart.render(positions.items, stockNames, fxRates);
-    rows($("#positions-body"), positions.items, (position) => {
-      const currency = positionCurrency(position);
-      const pnl = Number(position.unrealized_pnl);
-      const costBasis = Number(position.cost_basis ?? Number(position.average_price) * Number(position.quantity));
-      const pnlReturn = position.unrealized_return ?? (Number.isFinite(pnl) && costBasis > 0 ? pnl / costBasis : null);
-      const pnlClass = pnl > 0 ? "positive" : pnl < 0 ? "negative" : "neutral";
-      return `<tr>
-        <td><strong>${esc(position.symbol)}</strong></td>
-        <td>${esc(position.name || stockNames.get(position.symbol) || position.symbol)}</td>
-        <td>${money(position.quantity)}</td>
-        <td>${currencyMoney(position.average_price, currency)}</td>
-        <td>${currencyMoney(position.market_price, currency)}</td>
-        <td><span class="position-pnl ${pnlClass}">${currencyMoney(position.unrealized_pnl, currency, true)}</span><small class="position-return ${pnlClass}">${percent(pnlReturn)}</small></td>
-        <td><span class="price-time">${date(position.price_updated_at, true)}</span><small class="currency-code">${currency}</small></td>
-      </tr>`;
-    });
-    rows($("#auto-trade-symbols-body"), autoSymbols.items, (item) => {
-      const draft = autoStrategyDrafts.get(item.symbol);
-      const settings = { ...item, ...(draft || {}) };
-      return `<tr data-symbol="${esc(item.symbol)}">
-        <td data-label="심볼"><strong>${esc(item.symbol)}</strong></td>
-        <td data-label="종목명">${esc(item.name)}</td>
-        <td data-label="상태">${esc(item.status)}</td>
-        <td data-label="현재 보유">${money(heldQuantities.get(item.symbol) || 0)}주</td>
-        <td data-label="1회 주문 수량"><div class="auto-setting-control"><input class="auto-setting-input" aria-label="${esc(item.name)} 1회 주문 수량" type="number" min="0.00000001" step="any" data-auto-setting="order_quantity" value="${esc(settings.order_quantity ?? 1)}" /><small class="setting-state${draft ? " pending" : ""}" data-setting-state>${draft ? "변경됨 · 재개 시 적용" : "적용됨"}</small></div></td>
-        <td class="auto-symbol-action">${heldQuantities.has(item.symbol) ? '<span class="pill" title="보유 포지션을 먼저 정리해야 제외할 수 있습니다.">보유 중</span>' : `<button class="button ghost remove-auto-symbol" type="button" data-remove-auto-symbol="${esc(item.symbol)}">제외</button>`}</td>
-      </tr>`;
-    });
-    const activeStrategies = strategies.items.filter((strategy) => strategy.enabled && queuedAutoTradeSymbols.has(strategy.symbol));
-    rows($("#strategies-body"), activeStrategies, (strategy) => `<tr><td>${esc(stockNames.get(strategy.symbol) || strategy.symbol)} 자동매매</td><td>${esc(strategy.symbol)}</td><td><span class="badge">운영 중</span></td></tr>`, "현재 실행 중인 전략이 없습니다.");
     const refreshedAt = new Date();
     $("#last-refreshed").textContent = `마지막 갱신 ${date(refreshedAt)}`;
     $("#last-refreshed").dateTime = refreshedAt.toISOString();
@@ -151,20 +175,9 @@ async function postControl(action) {
   try {
     const options = { method: "POST" };
     if (action === "resume") {
-      const settings = {};
-      for (const row of document.querySelectorAll("#auto-trade-symbols-body tr[data-symbol]")) {
-        const symbol = row.dataset.symbol;
-        const orderQuantity = row.querySelector('[data-auto-setting="order_quantity"]').value;
-        if (!Number.isFinite(Number(orderQuantity)) || !(Number(orderQuantity) > 0)) {
-          throw new Error(`${symbol}: 주문 수량은 0보다 큰 숫자로 입력하세요.`);
-        }
-        settings[symbol] = { order_quantity: orderQuantity };
-        autoStrategyDrafts.set(symbol, settings[symbol]);
-      }
-      options.body = JSON.stringify({ settings });
+      options.body = JSON.stringify({ settings: {} });
     }
     const result = await api(`/api/v1/controls/${action}`, options);
-    if (action === "resume") autoStrategyDrafts.clear();
     const count = result.auto_strategies?.length || 0;
     show(action === "resume" && count
       ? `거래 재개: ${count}개 종목의 이동평균 PAPER 전략을 시작했습니다.`
@@ -174,7 +187,56 @@ async function postControl(action) {
   catch (error) { show(error.message, true); }
 }
 
-$("#refresh").addEventListener("click", refresh);
+$("#auto-discovery-form").addEventListener("input", () => { autoDiscoveryDraft = true; });
+$("#auto-discovery-form").addEventListener("change", () => { autoDiscoveryDraft = true; });
+$("#auto-discovery-sizing").addEventListener("change", updateInvestmentMode);
+$("#auto-discovery-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (autoDiscoveryBusy) return;
+  const button = $("#auto-discovery-start");
+  autoDiscoveryBusy = true;
+  button.disabled = true;
+  button.textContent = "섹터 종목 발굴 중…";
+  $("#auto-discovery-stop").disabled = false;
+  try {
+    const budgetMode = $("#auto-discovery-sizing").value === "budget";
+    const amount = $(budgetMode ? "#auto-discovery-budget" : "#auto-discovery-quantity").value;
+    if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) {
+      throw new Error(budgetMode ? "총 투자금액은 0보다 큰 금액으로 입력하세요." : "주문 수량은 0보다 큰 숫자로 입력하세요.");
+    }
+    if (budgetMode && $("#auto-discovery-market").value !== "KR") {
+      throw new Error("금액 기준 분산투자는 국내 주식에서 지원합니다. 미국 주식은 수량 직접 지정을 선택하세요.");
+    }
+    const result = await api("/api/v1/auto-discovery/start", {
+      method: "POST",
+      body: JSON.stringify({
+        keyword: $("#auto-discovery-keyword").value.trim(),
+        market: $("#auto-discovery-market").value,
+        max_symbols: Number($("#auto-discovery-count").value),
+        ...(budgetMode ? { total_investment: amount } : { order_quantity: amount })
+      })
+    });
+    autoDiscoveryDraft = false;
+    show("자동 발굴·매매 시작: " + result.status.selected_symbols.length + "개 종목의 시세 수집과 PAPER 전략을 실행합니다.");
+  } catch (error) {
+    show(error.message, true);
+  } finally {
+    autoDiscoveryBusy = false;
+    button.textContent = "자동 발굴·매매 시작";
+    await refresh();
+  }
+});
+$("#auto-discovery-stop").addEventListener("click", async (event) => {
+  event.currentTarget.disabled = true;
+  try {
+    await api("/api/v1/auto-discovery/stop", { method: "POST" });
+    show("자동 발굴과 PAPER 매매를 정지했습니다. 보유 포지션은 유지됩니다.");
+  } catch (error) {
+    show(error.message, true);
+  } finally {
+    await refresh();
+  }
+});
 $("#volume-results").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-add-search-symbol]");
   if (!button || button.disabled) return;
@@ -190,36 +252,13 @@ $("#volume-results").addEventListener("click", async (event) => {
       method: "POST",
       body: JSON.stringify({ symbol: button.dataset.addSearchSymbol })
     });
-    show(`${button.dataset.stockName}을 자동매매 목록에 담았습니다. 거래 재개를 누르면 전략이 시작됩니다.`);
+    show(`${button.dataset.stockName}을 자동매매 목록에 담았습니다. 수동 검색 영역의 ‘담은 종목 실행’을 누르면 저장된 주문 수량으로 전략이 시작됩니다.`);
     button.textContent = "담김";
     queuedAutoTradeSymbols.add(button.dataset.addSearchSymbol);
     await refresh();
   } catch (error) {
     button.disabled = false;
     show(error.message, true);
-  }
-});
-$("#auto-trade-symbols-body").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-remove-auto-symbol]");
-  if (!button) return;
-  try {
-    await api(`/api/v1/auto-trade-symbols/${encodeURIComponent(button.dataset.removeAutoSymbol)}`, { method: "DELETE" });
-    autoStrategyDrafts.delete(button.dataset.removeAutoSymbol);
-    show(`${button.dataset.removeAutoSymbol}을 자동매매 목록에서 제외했습니다.`);
-    await refresh();
-  } catch (error) { show(error.message, true); }
-});
-$("#auto-trade-symbols-body").addEventListener("input", (event) => {
-  const input = event.target.closest("[data-auto-setting]");
-  if (!input) return;
-  const row = input.closest("tr[data-symbol]");
-  const current = autoStrategyDrafts.get(row.dataset.symbol) || {};
-  current[input.dataset.autoSetting] = input.value;
-  autoStrategyDrafts.set(row.dataset.symbol, current);
-  const state = row.querySelector("[data-setting-state]");
-  if (state) {
-    state.textContent = "변경됨 · 재개 시 적용";
-    state.classList.add("pending");
   }
 });
 

@@ -50,6 +50,7 @@ function fixture() {
   find(".investment-tooltip").querySelector = find;
   find(".investment-svg").append(find(".investment-segments"));
   const document = { activeElement: null, addEventListener() {},
+    createElement: (tag) => new Element(tag),
     createElementNS: (_, tag) => new Element(tag), createDocumentFragment: () => new Element("fragment") };
   const context = vm.createContext({ document, window: { addEventListener() {} }, Intl });
   vm.runInContext(readFileSync(join(__dirname, "../auto_trader/static/investment_chart.js"), "utf8") + "\nthis.Chart = InvestmentChart;", context);
@@ -64,6 +65,8 @@ test("empty and sold positions show an empty ring and no tooltip", () => {
   chart.render([position("SOLD", 0, 120)], new Map());
   assert.equal(find("#investment-total").textContent, "₩0");
   assert.equal(find(".investment-segments").children.length, 0);
+  assert.equal(find(".investment-legend").children.length, 1);
+  assert.match(find(".investment-legend").children[0].textContent, /보유한 종목이 없습니다/);
   assert.equal(find(".investment-tooltip").hidden, true);
 });
 
@@ -90,6 +93,10 @@ test("multiple stocks keep individual values and safe text names", () => {
   assert.match(path.attributes["aria-label"], /25.0%/);
   chart.select({ target: path, type: "focusin" });
   assert.equal(find("[data-investment-name]").textContent, "<script>alert(1)</script>");
+  const legendRows = find(".investment-legend").children;
+  assert.equal(legendRows[1].children[1].children[0].textContent, "<script>alert(1)</script>");
+  assert.equal(legendRows[1].children[0].style.background, path.attributes.fill);
+  assert.equal(legendRows[1].children[2].children[1].textContent, "25.0%");
   assert.equal(find("[data-investment-pnl]").textContent, "-₩20 (-10.00%)");
   assert.equal(find("[data-investment-pnl]").classes.has("negative"), true);
   chart.show("BBB", null);

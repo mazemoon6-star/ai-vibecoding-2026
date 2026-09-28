@@ -132,16 +132,28 @@ class TossClient:
     async def get_volume_rankings(self, market_country: str) -> dict[str, Any]:
         """Return Toss market-wide trading-volume rankings for KR or US."""
 
+        return await self.get_market_rankings(market_country, "MARKET_TRADING_VOLUME")
+
+    async def get_market_rankings(
+        self,
+        market_country: str,
+        ranking_type: str = "MARKET_TRADING_AMOUNT",
+    ) -> dict[str, Any]:
+        """Return a market ranking, using trading value as the default liquidity filter."""
+
         if market_country not in {"KR", "US"}:
             raise TossApiError("invalid_market", "market은 KR 또는 US여야 합니다.", 422)
+        if ranking_type not in {"MARKET_TRADING_AMOUNT", "MARKET_TRADING_VOLUME"}:
+            raise TossApiError("invalid_ranking_type", "지원하지 않는 거래 순위 기준입니다.", 422)
         self._require_market_data()
         payload = await self._get_json(
             "/api/v1/rankings",
             {
-                "type": "MARKET_TRADING_VOLUME",
+                "type": ranking_type,
                 "marketCountry": market_country,
                 "duration": "realtime",
                 "count": "100",
+                "excludeInvestmentCaution": "true",
             },
         )
         result = payload.get("result")

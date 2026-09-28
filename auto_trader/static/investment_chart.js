@@ -6,6 +6,7 @@ class InvestmentChart {
     this.segments = root.querySelector(".investment-segments");
     this.stage = root.querySelector(".investment-stage");
     this.tooltip = root.querySelector(".investment-tooltip");
+    this.legend = root.querySelector(".investment-legend");
     this.positions = new Map();
     this.colors = new Map();
     this.signature = null;
@@ -97,7 +98,7 @@ class InvestmentChart {
           : "평균매수가 × 보유 수량 기준 · 차트에서 종목별 투자 정보를 확인하세요."
       : "보유 종목이 없습니다. 매수가 체결되면 투자 현황이 표시됩니다.";
 
-    const signature = JSON.stringify(items.map(({ symbol, name, convertedCost }) => [symbol, name, convertedCost]));
+    const signature = JSON.stringify(items.map(({ symbol, name, cost, currency, convertedCost }) => [symbol, name, cost, currency, convertedCost]));
     if (signature !== this.signature) {
       const focusedSymbol = this.svg.contains(document.activeElement)
         ? document.activeElement.dataset.investmentSymbol : null;
@@ -120,6 +121,7 @@ class InvestmentChart {
         start = end;
       }
       this.segments.replaceChildren(fragment);
+      this.renderLegend(items, total);
       this.signature = signature;
       if (focusedSymbol) {
         [...this.segments.querySelectorAll("path")].find((node) => node.dataset.investmentSymbol === focusedSymbol)?.focus();
@@ -139,6 +141,36 @@ class InvestmentChart {
     const point = Number.isFinite(event.clientX) && event.type !== "keydown" && event.type !== "focusin"
       ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : null;
     this.show(slice.dataset.investmentSymbol, point);
+  }
+
+  renderLegend(items, total) {
+    const fragment = document.createDocumentFragment();
+    const node = (tag, className, text) => {
+      const element = document.createElement(tag);
+      element.className = className;
+      if (text !== undefined) element.textContent = text;
+      return element;
+    };
+    if (!items.length) {
+      fragment.append(node("li", "investment-legend-empty", "아직 보유한 종목이 없습니다. 매수 체결 후 종목과 투자 비중이 표시됩니다."));
+    }
+    for (const item of items) {
+      const row = node("li", "investment-legend-item");
+      const dot = node("span", "investment-legend-dot");
+      dot.style.background = this.color(item.symbol);
+      dot.setAttribute("aria-hidden", "true");
+      const label = node("div", "investment-legend-label");
+      label.append(node("strong", "", item.name));
+      label.append(node("small", "", item.symbol));
+      const value = node("div", "investment-legend-value");
+      value.append(node("strong", "", this.amount(item.cost, item.currency)));
+      value.append(node("small", "", ((item.convertedCost / total) * 100).toFixed(1) + "%"));
+      row.append(dot);
+      row.append(label);
+      row.append(value);
+      fragment.append(row);
+    }
+    this.legend.replaceChildren(fragment);
   }
 
   show(symbol, anchor) {

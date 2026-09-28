@@ -154,6 +154,57 @@ class AutoStrategyOrderSettings(BaseModel):
     order_quantity: Decimal = Field(gt=0)
 
 
+class AutoDiscoveryRequest(BaseModel):
+    """User settings for sector-based automatic PAPER stock selection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    keyword: str = Field(min_length=1, max_length=80)
+    market: Literal["KR", "US"] = "KR"
+    max_symbols: int = Field(default=3, ge=1, le=10)
+    order_quantity: Decimal = Field(default=Decimal("1"), gt=0)
+    total_investment: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=2)
+
+    @model_validator(mode="after")
+    def validate_budget_market(self) -> "AutoDiscoveryRequest":
+        if self.total_investment is not None and self.market != "KR":
+            raise ValueError("금액 기준 분산투자는 국내 주식(KR)에서 지원합니다.")
+        return self
+
+    @field_validator("keyword")
+    @classmethod
+    def normalize_keyword(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("keyword must not be blank")
+        return value
+
+
+class AutoDiscoveryConfig(AutoDiscoveryRequest):
+    """Persisted discovery settings and the symbols managed by the scanner."""
+
+    keyword: str = Field(default="", max_length=80)
+    enabled: bool = False
+    revision: int = Field(default=0, ge=0)
+    managed_symbols: list[str] = Field(default_factory=list)
+
+    @field_validator("keyword")
+    @classmethod
+    def normalize_keyword(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def validate_enabled_keyword(self) -> "AutoDiscoveryConfig":
+        if self.enabled and not self.keyword:
+            raise ValueError("enabled discovery requires a keyword")
+        return self
+
+    @field_validator("managed_symbols")
+    @classmethod
+    def normalize_managed_symbols(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(value.strip().upper() for value in values if value.strip()))
+
+
 class AutoStrategyResumeRequest(BaseModel):
     """Per-symbol order quantities submitted when resuming trading."""
 

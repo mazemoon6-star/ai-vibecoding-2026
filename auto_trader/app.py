@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import TossConfig, load_local_env
 from .instruments import instrument_name
-from .models import AssistantChatRequest, AutoStrategyResumeRequest, AutoStrategySettings, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderStatus, StrategyRequest, TickRequest
+from .models import AssistantChatRequest, AutoDiscoveryRequest, AutoStrategyResumeRequest, AutoStrategySettings, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderStatus, StrategyRequest, TickRequest
 from .paper_engine import EngineError, PaperEngine
 from .related_stock_search import expand_keyword, search_direct_stocks, search_related_stocks
 from .toss_client import TossApiError, TossClient
@@ -36,8 +36,9 @@ def _decimal_env(name: str, default: str) -> Decimal:
     return value
 
 
+configured_initial_cash = _decimal_env("PAPER_INITIAL_CASH", "10000000")
 engine = PaperEngine(
-    initial_cash=_decimal_env("PAPER_INITIAL_CASH", "1000000"),
+    initial_cash=configured_initial_cash,
     fee_rate=_decimal_env("PAPER_FEE_RATE", "0.00015"),
     slippage_rate=_decimal_env("PAPER_SLIPPAGE_RATE", "0"),
 )
@@ -52,6 +53,14 @@ if not STATE_PATH.is_absolute():
 logger = logging.getLogger(__name__)
 exchange_rate_cache: dict[str, object] | None = None
 exchange_rate_lock = asyncio.Lock()
+AUTO_DISCOVERY_SCAN_INTERVAL = 300
+auto_discovery_last_attempt: datetime | None = None
+auto_discovery_lock = asyncio.Lock()
+auto_discovery_status: dict[str, object] = {
+    "last_scan_at": None,
+    "selected_symbols": [],
+    "error": None,
+}
 
 
 async def _usd_krw_exchange_rate() -> dict[str, object]:
@@ -80,11 +89,128 @@ async def _usd_krw_exchange_rate() -> dict[str, object]:
         return exchange_rate_cache
 
 
+async def _scan_auto_discovery(
+    request: AutoDiscoveryRequest | None = None, *, start: bool = False
+) -> list[dict[str, object]]:
+    """Serialize scans and keep status readable when a refresh fails."""
+    global auto_discovery_last_attempt
+    starting_revision = (await engine.auto_discovery_snapshot())["revision"] if start else None
+    async with auto_discovery_lock:
+        config = await engine.auto_discovery_snapshot()
+        if start and config["revision"] != starting_revision:
+            raise EngineError("discovery_interrupted", "운영 설정이 변경되어 진행 중인 자동 발굴을 취소했습니다.", 409)
+        if not start and (not config["enabled"] or not engine.trading_enabled):
+            return []
+        if request is None:
+            request = AutoDiscoveryRequest.model_validate({
+                key: config[key] for key in ("keyword", "market", "max_symbols", "order_quantity", "total_investment")
+            })
+        auto_discovery_last_attempt = datetime.now(timezone.utc)
+        auto_discovery_status.update(last_attempt_at=auto_discovery_last_attempt, scanning=True)
+        try:
+            return await _apply_auto_discovery_scan(request, int(config["revision"]), start=start)
+        except (TossApiError, EngineError) as exc:
+            auto_discovery_status["error"] = exc.message
+            raise
+        finally:
+            auto_discovery_status["scanning"] = False
+
+
+async def _apply_auto_discovery_scan(
+    request: AutoDiscoveryRequest, expected_revision: int, *, start: bool
+) -> list[dict[str, object]]:
+    """Select liquid, sector-matched symbols and activate their PAPER strategies."""
+
+    if not toss_client.configured:
+        raise TossApiError("toss_not_configured", "자동 발굴에는 토스 시세 연동 설정이 필요합니다.", 503)
+
+    direct_candidates = search_direct_stocks(request.keyword, request.market, limit=20)
+    candidates = direct_candidates or search_related_stocks(
+        request.keyword, request.market, limit=100
+    )
+    candidates_by_symbol = {
+        str(item["symbol"]).strip().upper(): item
+        for item in candidates
+        if item.get("symbol")
+        and (direct_candidates or int(item.get("relevance_score", 0)) >= 25)
+    }
+    if not candidates_by_symbol:
+        raise EngineError("no_sector_candidates", "입력한 섹터와 일치하는 종목을 찾지 못했습니다.", 422)
+
+    ranking = await toss_client.get_market_rankings(request.market, "MARKET_TRADING_AMOUNT")
+    ranked_items = sorted(
+        (item for item in ranking.get("rankings", []) if isinstance(item, dict)),
+        key=lambda item: int(item["rank"]) if str(item.get("rank", "")).isdigit() else float("inf"),
+    )
+    ordered_symbols = [
+        str(item.get("symbol", "")).strip().upper()
+        for item in ranked_items
+        if isinstance(item, dict) and item.get("symbol")
+    ]
+    selected_symbols = list(dict.fromkeys(
+        symbol for symbol in ordered_symbols if symbol in candidates_by_symbol
+    ))[:request.max_symbols]
+    if not selected_symbols:
+        raise EngineError(
+            "no_liquid_sector_candidates",
+            "섹터 후보가 현재 거래대금 상위 100종목에 없습니다. 섹터 키워드나 시장을 확인하세요.",
+            422,
+        )
+
+    quotes = await toss_client.get_prices(selected_symbols)
+    ticks = {}
+    for item in quotes:
+        symbol = str(item.get("symbol", "")).strip().upper()
+        if symbol not in selected_symbols:
+            continue
+        try:
+            price = Decimal(str(item.get("lastPrice")))
+        except (InvalidOperation, ValueError):
+            continue
+        if not price.is_finite() or price <= 0:
+            continue
+        timestamp = datetime.now(timezone.utc)
+        if isinstance(item.get("timestamp"), str):
+            try:
+                timestamp = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        ticks[symbol] = TickRequest(
+            symbol=symbol, name=str(candidates_by_symbol[symbol]["name"]), price=price,
+            currency="KRW" if request.market == "KR" else "USD", timestamp=timestamp,
+        )
+    if any(symbol not in ticks for symbol in selected_symbols):
+        raise EngineError("price_unavailable", "선정 종목의 현재가를 확보하지 못했습니다. 잠시 후 다시 시작하세요.", 409)
+    for tick in ticks.values():
+        await engine.update_tick(tick)
+    items = await engine.apply_auto_discovery_selection(
+        request, selected_symbols, expected_revision=expected_revision, start=start
+    )
+    auto_discovery_status.update(
+        last_scan_at=datetime.now(timezone.utc),
+        selected_symbols=selected_symbols,
+        retiring_symbols=[item["symbol"] for item in items if not item["entry_enabled"]],
+        candidate_count=len(candidates_by_symbol), error=None,
+    )
+    return items
+
+
 async def _market_data_monitor() -> None:
     """Poll held and activated auto-strategy symbols into the PAPER engine."""
 
     while True:
         try:
+            discovery = await engine.auto_discovery_snapshot()
+            if discovery["enabled"] and engine.trading_enabled:
+                now = datetime.now(timezone.utc)
+                if (
+                    auto_discovery_last_attempt is None
+                    or (now - auto_discovery_last_attempt).total_seconds() >= AUTO_DISCOVERY_SCAN_INTERVAL
+                ):
+                    try:
+                        await _scan_auto_discovery()
+                    except (TossApiError, EngineError) as exc:
+                        logger.warning("PAPER auto-discovery scan failed: %s", getattr(exc, "code", "scan_error"))
             positions = [position for position in await engine.positions_snapshot() if position["quantity"] > 0]
             symbols = list(dict.fromkeys(
                 [str(position["symbol"]) for position in positions]
@@ -100,6 +226,8 @@ async def _market_data_monitor() -> None:
                         price = Decimal(str(raw_price))
                     except (InvalidOperation, ValueError):
                         continue
+                    if not price.is_finite() or price <= 0:
+                        continue
                     timestamp = datetime.now(timezone.utc)
                     raw_timestamp = item.get("timestamp")
                     if isinstance(raw_timestamp, str):
@@ -110,7 +238,7 @@ async def _market_data_monitor() -> None:
                     await engine.update_tick(
                         TickRequest(
                             symbol=symbol,
-                            name=instrument_name(symbol),
+                            name=engine.ticks[symbol].name if symbol in engine.ticks else instrument_name(symbol),
                             price=price,
                             currency=item.get("currency") if item.get("currency") in {"KRW", "USD"} else None,
                             timestamp=timestamp,
@@ -131,6 +259,7 @@ async def _market_data_monitor() -> None:
 async def lifespan(_: FastAPI):
     """Restore the account before polling; every state mutation is committed."""
     engine.enable_persistence(STATE_PATH)
+    await engine.configure_untraded_initial_cash(configured_initial_cash)
     await engine.enforce_fixed_auto_windows()
     monitor_task = asyncio.create_task(_market_data_monitor()) if toss_client.configured else None
     try:
@@ -465,6 +594,50 @@ async def cancel_order(order_id: str) -> dict[str, object]:
 @app.get("/api/v1/auto-trade-symbols")
 async def auto_trade_symbols() -> dict[str, object]:
     return {"items": await engine.auto_watchlist_snapshot()}
+
+
+@app.get("/api/v1/auto-discovery")
+async def get_auto_discovery() -> dict[str, object]:
+    config = await engine.auto_discovery_snapshot()
+    managed = [
+        item for item in await engine.auto_watchlist_snapshot()
+        if item["symbol"] in config["managed_symbols"]
+    ]
+    return {
+        **config,
+        "trading_enabled": engine.trading_enabled,
+        **auto_discovery_status,
+        "selected_symbols": [item["symbol"] for item in managed if item["entry_enabled"]],
+        "retiring_symbols": [item["symbol"] for item in managed if not item["entry_enabled"]],
+        "allocation": await engine.auto_allocation_snapshot(),
+    }
+
+
+@app.post("/api/v1/auto-discovery/start")
+async def start_auto_discovery(request: AutoDiscoveryRequest) -> dict[str, object]:
+    if not toss_client.configured:
+        raise TossApiError("toss_not_configured", "자동 발굴을 시작하려면 .env에서 토스 시세 연동을 설정하세요.", 503)
+    selected = await _scan_auto_discovery(request, start=True)
+    return {
+        "config": await engine.auto_discovery_snapshot(),
+        "selected": selected,
+        "allocation": await engine.auto_allocation_snapshot(),
+        "status": auto_discovery_status,
+        "trading_enabled": engine.trading_enabled,
+        "paper_only": True,
+    }
+
+
+@app.post("/api/v1/auto-discovery/stop")
+async def stop_auto_discovery() -> dict[str, object]:
+    config = await engine.stop_auto_discovery()
+    return {
+        "config": config,
+        "trading_enabled": engine.trading_enabled,
+        "managed_symbols": config["managed_symbols"],
+        "open_positions_remain": True,
+        "paper_only": True,
+    }
 
 
 @app.post("/api/v1/auto-trade-symbols", status_code=status.HTTP_201_CREATED)
