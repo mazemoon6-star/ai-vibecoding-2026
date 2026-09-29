@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import TossConfig, load_local_env
 from .instruments import instrument_name
+from .investment_planner import InvestmentPlannerClient
 from .models import AssistantChatRequest, AutoDiscoveryRequest, AutoStrategyResumeRequest, AutoStrategySettings, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderStatus, StrategyRequest, TickRequest
 from .paper_engine import EngineError, PaperEngine
 from .related_stock_search import expand_keyword, search_direct_stocks, search_related_stocks
@@ -45,6 +46,7 @@ engine = PaperEngine(
 toss_config = TossConfig.from_env()
 toss_client = TossClient(toss_config)
 trading_assistant = TradingAssistantClient()
+investment_planner = InvestmentPlannerClient()
 STATIC_DIR = Path(__file__).parent / "static"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 STATE_PATH = Path(os.getenv("PAPER_STATE_PATH", "data/paper_state.sqlite3"))
@@ -103,13 +105,13 @@ async def _scan_auto_discovery(
             return []
         if request is None:
             request = AutoDiscoveryRequest.model_validate({
-                key: config[key] for key in ("keyword", "market", "max_symbols", "order_quantity", "total_investment")
+                key: config[key] for key in ("keyword", "market", "max_symbols", "order_quantity", "total_investment", "cash_percentage")
             })
         auto_discovery_last_attempt = datetime.now(timezone.utc)
         auto_discovery_status.update(last_attempt_at=auto_discovery_last_attempt, scanning=True)
         try:
             return await _apply_auto_discovery_scan(request, int(config["revision"]), start=start)
-        except (TossApiError, EngineError) as exc:
+        except (TossApiError, EngineError, TradingAssistantError) as exc:
             auto_discovery_status["error"] = exc.message
             raise
         finally:
@@ -123,6 +125,8 @@ async def _apply_auto_discovery_scan(
 
     if not toss_client.configured:
         raise TossApiError("toss_not_configured", "자동 발굴에는 토스 시세 연동 설정이 필요합니다.", 503)
+    if request.cash_percentage is not None and not investment_planner.configured:
+        raise TradingAssistantError("openai_not_configured", "AI 자동 배분을 사용하려면 서버 .env에 OPENAI_API_KEY를 설정하고 서버를 다시 시작하세요.", 503)
 
     direct_candidates = search_direct_stocks(request.keyword, request.market, limit=20)
     candidates = direct_candidates or search_related_stocks(
@@ -149,7 +153,9 @@ async def _apply_auto_discovery_scan(
     ]
     selected_symbols = list(dict.fromkeys(
         symbol for symbol in ordered_symbols if symbol in candidates_by_symbol
-    ))[:request.max_symbols]
+    ))
+    if request.cash_percentage is None:
+        selected_symbols = selected_symbols[:request.max_symbols]
     if not selected_symbols:
         raise EngineError(
             "no_liquid_sector_candidates",
@@ -181,10 +187,40 @@ async def _apply_auto_discovery_scan(
         )
     if any(symbol not in ticks for symbol in selected_symbols):
         raise EngineError("price_unavailable", "선정 종목의 현재가를 확보하지 못했습니다. 잠시 후 다시 시작하세요.", 409)
-    for tick in ticks.values():
-        await engine.update_tick(tick)
+    weights = None
+    planner_reason = ""
+    planner_model = None
+    if request.cash_percentage is not None:
+        account = await engine.account()
+        allocation = await engine.auto_allocation_snapshot()
+        if start:
+            new_budget = Decimal(str(account["available_cash"])) * request.cash_percentage / 100
+            if new_budget < Decimal("0.01"):
+                raise EngineError("insufficient_investment_cash", "투자 가능한 가용현금이 없습니다.", 422)
+        else:
+            new_budget = allocation["available_for_investment"] if allocation else Decimal("0")
+        plan = await investment_planner.plan({
+            "keyword": request.keyword, "cash_percentage": request.cash_percentage,
+            "available_cash": account["available_cash"],
+            "new_investment_budget": new_budget,
+            "existing_total_limit": request.total_investment,
+            "existing_positions": await engine.positions_snapshot(),
+            "fee_rate": engine.fee_rate,
+            "candidates": [{
+                "symbol": symbol, "name": candidates_by_symbol[symbol]["name"],
+                "price": ticks[symbol].price, "trading_amount_order": ordered_symbols.index(symbol) + 1,
+                "relevance_score": candidates_by_symbol[symbol].get("relevance_score"),
+                "business_summary": candidates_by_symbol[symbol].get("business_summary"),
+            } for symbol in selected_symbols],
+        })
+        selected_symbols = [item.symbol for item in plan.items]
+        weights = {item.symbol: Decimal(item.weight_percent) for item in plan.items}
+        planner_reason, planner_model = plan.reason, investment_planner.model
+    for symbol in selected_symbols:
+        await engine.update_tick(ticks[symbol])
     items = await engine.apply_auto_discovery_selection(
-        request, selected_symbols, expected_revision=expected_revision, start=start
+        request, selected_symbols, expected_revision=expected_revision, start=start,
+        allocation_weights=weights, planner_reason=planner_reason, planner_model=planner_model,
     )
     auto_discovery_status.update(
         last_scan_at=datetime.now(timezone.utc),
@@ -209,7 +245,7 @@ async def _market_data_monitor() -> None:
                 ):
                     try:
                         await _scan_auto_discovery()
-                    except (TossApiError, EngineError) as exc:
+                    except (TossApiError, EngineError, TradingAssistantError) as exc:
                         logger.warning("PAPER auto-discovery scan failed: %s", getattr(exc, "code", "scan_error"))
             positions = [position for position in await engine.positions_snapshot() if position["quantity"] > 0]
             symbols = list(dict.fromkeys(
@@ -610,6 +646,7 @@ async def get_auto_discovery() -> dict[str, object]:
         "selected_symbols": [item["symbol"] for item in managed if item["entry_enabled"]],
         "retiring_symbols": [item["symbol"] for item in managed if not item["entry_enabled"]],
         "allocation": await engine.auto_allocation_snapshot(),
+        "planner": investment_planner.status(),
     }
 
 

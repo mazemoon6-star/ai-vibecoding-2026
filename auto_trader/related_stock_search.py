@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import re
 import unicodedata
 
+from .sector_catalog import SECTOR_COMPANIES, SECTOR_CONCEPTS, SECTOR_LABELS
+
 
 @dataclass(frozen=True)
 class StockProfile:
@@ -65,7 +67,10 @@ CONCEPTS: dict[str, tuple[str, ...]] = {
         "자동차 열관리", "차량 열관리", "자동차 냉각", "파워트레인 냉각",
         "powertrain cooling", "차량 공조", "전기차 열관리", "EV thermal management",
     ),
+    **SECTOR_CONCEPTS,
 }
+
+COOLING_CONCEPTS = {"data_center", "liquid_cooling", "thermal_management", "hvac", "industrial_cooling"}
 
 COOLING_QUERY_ALIASES = {
     "냉각", "냉각 시스템", "냉각 장비", "냉각 설비", "산업용 냉각",
@@ -108,6 +113,7 @@ STOCK_PROFILES: tuple[StockProfile, ...] = (
         ("공정 온도 안정화", "친환경 냉매", "액체 냉각"),
         ("산업용 냉각", "반도체 공정", "칠러", "열관리"),
         (("industrial_cooling", "반도체 공정 온도를 제어하는 칠러 제조 사업"),
+         ("semiconductor", "반도체 공정용 스크러버와 온도 제어 칠러 공급"),
          ("thermal_management", "반도체 공정의 안정적 온도 제어와 열관리 장비"),
          ("liquid_cooling", "회사가 공개한 액체 냉각 기술 연구개발")),
         "https://www.gst-in.com/en/m31.php",
@@ -246,7 +252,18 @@ CONCEPT_LABELS = {
     "hvac": "냉동·공조(HVAC)",
     "industrial_cooling": "산업용·공정 냉각",
     "vehicle_thermal": "자동차 열관리",
+    **SECTOR_LABELS,
 }
+
+STOCK_PROFILES += tuple(
+    StockProfile(
+        company.symbol, company.name, company.market, company.business,
+        tuple(SECTOR_LABELS[concept] for concept in company.concepts),
+        company.products, (), tuple(CONCEPTS[concept][0] for concept in company.concepts),
+        tuple((concept, company.business) for concept in company.concepts), company.source_url,
+    )
+    for company in SECTOR_COMPANIES
+)
 
 CONCEPT_IMPORTANCE = {
     "data_center": 1.0,
@@ -257,11 +274,24 @@ CONCEPT_IMPORTANCE = {
     # Vehicle thermal systems are genuinely cooling-related, but are an
     # adjacent market for a general data-center/industrial cooling query.
     "vehicle_thermal": 0.45,
+    **{concept: 1.0 for concept in SECTOR_CONCEPTS},
 }
 
 
 def _normalize(value: str) -> str:
     return re.sub(r"[^0-9a-z가-힣]+", "", unicodedata.normalize("NFKC", value).casefold())
+
+
+def _alias_matches(alias: str, keyword: str) -> bool:
+    """Keep short English acronyms such as AI from matching inside air/coolant."""
+    normalized_alias, normalized_keyword = _normalize(alias), _normalize(keyword)
+    if not normalized_keyword:
+        return False
+    if re.fullmatch(r"[a-z0-9]{1,3}", normalized_alias):
+        return bool(re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", keyword, re.I))
+    if re.fullmatch(r"[a-z0-9]{1,3}", normalized_keyword):
+        return bool(re.search(r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])", alias, re.I))
+    return normalized_alias in normalized_keyword or normalized_keyword in normalized_alias
 
 
 def expand_keyword(keyword: str) -> dict[str, object]:
@@ -272,15 +302,21 @@ def expand_keyword(keyword: str) -> dict[str, object]:
     terms: dict[str, str] = {}
     concepts: set[str] = set()
 
+    exact_concepts = {
+        concept for concept, aliases in CONCEPTS.items()
+        if normalized and any(_normalize(alias) == normalized for alias in aliases)
+    }
     for concept, aliases in CONCEPTS.items():
-        if any(_normalize(alias) in normalized or normalized in _normalize(alias) for alias in aliases):
+        matches = concept in exact_concepts if exact_concepts else any(_alias_matches(alias, original) for alias in aliases)
+        if matches:
             concepts.add(concept)
             for alias in aliases:
                 terms.setdefault(_normalize(alias), alias)
 
     if normalized in {_normalize(alias) for alias in COOLING_QUERY_ALIASES}:
-        concepts.update(concept for concept in CONCEPTS if concept != "vehicle_thermal")
-        for aliases in CONCEPTS.values():
+        concepts.update(COOLING_CONCEPTS)
+        for concept in COOLING_CONCEPTS:
+            aliases = CONCEPTS[concept]
             for alias in aliases:
                 terms.setdefault(_normalize(alias), alias)
 
@@ -308,6 +344,9 @@ def search_related_stocks(keyword: str, market: str = "KR", limit: int = 20) -> 
         if profile.market != market:
             continue
         profile_reason_concepts = {concept for concept, _ in profile.reasons}
+        sector_concepts = set(expansion["concepts"]) & SECTOR_CONCEPTS.keys()
+        if sector_concepts and not profile_reason_concepts.intersection(sector_concepts):
+            continue
         if core_cooling_query and not profile_reason_concepts.intersection({"data_center", "liquid_cooling"}):
             continue
         fields = {
@@ -363,7 +402,9 @@ def search_related_stocks(keyword: str, market: str = "KR", limit: int = 20) -> 
         if not related_industries:
             related_industries = list(profile.industries[:2])
 
-        relevance_score = min(100, round(score / (len(CONCEPTS) * 6 + 8) * 100))
+        # Normalize against the query, so adding unrelated catalog sectors does
+        # not dilute every score below the auto-discovery admission threshold.
+        relevance_score = min(100, round(score / (max(1, len(expansion["concepts"])) * 6 + 8) * 100))
         relevance_label = "높음" if relevance_score >= 55 else "보통" if relevance_score >= 25 else "참고"
         results.append({
             "symbol": profile.symbol,
@@ -413,6 +454,13 @@ def search_direct_stocks(query: str, market: str = "KR", limit: int = 5) -> list
         raise ValueError("market은 KR 또는 US여야 합니다.")
     normalized_query = _normalize(query)
     if not normalized_query:
+        return []
+    sector_query = normalized_query in {
+        _normalize(alias) for aliases in CONCEPTS.values() for alias in aliases
+    }
+    # Sector words (including the SMR ticker) must reach the industry search,
+    # not be intercepted by a partial company name or an unknown US ticker.
+    if sector_query or normalized_query in {_normalize(alias) for alias in COOLING_QUERY_ALIASES}:
         return []
 
     candidates: dict[str, tuple[str, str, tuple[str, ...]]] = {}

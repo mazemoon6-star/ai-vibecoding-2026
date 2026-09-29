@@ -820,12 +820,15 @@ class PaperEngine:
                     "estimated_quantity": plan["quantity"], "estimated_price": plan["price"],
                     "estimated_fee": plan["fee"], "estimated_total": plan["estimated_total"],
                     "remaining": plan["remaining"],
+                    "weight_percent": self.auto_discovery.allocation_weights.get(symbol),
                 })
             return {
                 "currency": "KRW", "total_investment": total, "committed": committed,
                 "retiring_committed": retiring_cost,
                 "available_for_investment": max(Decimal("0"), min(total - committed, self.available_cash)),
                 "fee_rate": self.fee_rate, "slippage_rate": self.slippage_rate, "items": items,
+                "cash_percentage": self.auto_discovery.cash_percentage,
+                "cash_base": self.auto_discovery.cash_base,
             }
 
     async def apply_auto_discovery_selection(
@@ -835,6 +838,9 @@ class PaperEngine:
         *,
         expected_revision: int,
         start: bool = False,
+        allocation_weights: dict[str, Decimal] | None = None,
+        planner_reason: str = "",
+        planner_model: str | None = None,
     ) -> list[dict[str, Any]]:
         """Commit selection and strategy changes together after quotes are available."""
         selected = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols))
@@ -843,13 +849,39 @@ class PaperEngine:
                 raise EngineError("discovery_interrupted", "운영 설정이 변경되어 진행 중인 자동 발굴을 취소했습니다.", 409)
             if not start and (not self.auto_discovery.enabled or not self.trading_enabled):
                 raise EngineError("discovery_interrupted", "자동 발굴이 정지되었습니다.", 409)
-            if not selected or len(selected) > request.max_symbols:
+            if not selected or (request.cash_percentage is None and len(selected) > request.max_symbols):
                 raise EngineError("invalid_selection", "자동 선정 종목 수가 올바르지 않습니다.", 422)
             if any(symbol not in self.ticks for symbol in selected):
                 raise EngineError("price_unavailable", "선정 종목의 현재가를 확보하지 못했습니다.", 409)
 
             per_symbol_budget = None
-            if request.total_investment is not None:
+            budgets: dict[str, Decimal] = {}
+            cash_base = self.auto_discovery.cash_base if not start else None
+            effective_request = request
+            if request.cash_percentage is not None:
+                weights = allocation_weights or {}
+                if (set(weights) != set(selected) or any(not value.is_finite() or value <= 0 for value in weights.values())
+                        or sum(weights.values(), Decimal("0")) != 100):
+                    raise EngineError("invalid_allocation_weights", "AI 종목별 투자 비중이 올바르지 않습니다.", 422)
+                managed = set(self.auto_discovery.managed_symbols) | set(selected)
+                committed = self._committed_investment_unlocked(managed)
+                if start:
+                    cash_base = self.available_cash
+                    additional = (cash_base * request.cash_percentage / 100).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                    if additional <= 0:
+                        raise EngineError("insufficient_investment_cash", "투자 가능한 가용현금이 없습니다.", 422)
+                    total = (committed + additional).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                    additional = total - committed
+                else:
+                    total = self.auto_discovery.total_investment
+                    if total is None:
+                        raise EngineError("invalid_investment_budget", "저장된 투자 한도가 없습니다.", 409)
+                    additional = max(Decimal("0"), min(total - committed, self.available_cash))
+                effective_request = request.model_copy(update={"total_investment": total})
+                budgets = {symbol: self._committed_investment_unlocked({symbol})
+                    + (additional * weights[symbol] / 100).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+                    for symbol in selected}
+            if effective_request.total_investment is not None:
                 managed = set(self.auto_discovery.managed_symbols) | set(selected)
                 held = {symbol for symbol in managed if self.positions.get(symbol, Position(symbol)).quantity > 0}
                 if any(
@@ -858,12 +890,12 @@ class PaperEngine:
                 ) or any(instrument_currency(symbol) != "KRW" for symbol in held if symbol not in self.ticks):
                     raise EngineError("budget_currency_mismatch", "원화 배분 대상에는 원화 종목만 포함할 수 있습니다.", 422)
                 capacity = self.available_cash + sum((self._position_investment_unlocked(symbol) for symbol in held), Decimal("0"))
-                if start and request.total_investment > capacity:
+                if start and request.cash_percentage is None and request.total_investment > capacity:
                     raise EngineError("insufficient_investment_cash", "총 투자금액은 가용현금과 기존 배분 대상 보유금액의 합 이하여야 합니다.", 422)
                 retiring_cost = sum(
                     (self._position_investment_unlocked(symbol) for symbol in held - set(selected)), Decimal("0")
                 )
-                distributable = max(Decimal("0"), min(request.total_investment, capacity) - retiring_cost)
+                distributable = max(Decimal("0"), min(effective_request.total_investment, capacity) - retiring_cost)
                 per_symbol_budget = (distributable / len(selected)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
             retiring = []
@@ -898,13 +930,17 @@ class PaperEngine:
                     symbol, AutoStrategySettings(order_quantity=request.order_quantity)
                 )
                 strategy = self.strategies[self.auto_strategy_ids[symbol]]
-                strategy.investment_budget = per_symbol_budget
+                strategy.investment_budget = budgets.get(symbol, per_symbol_budget)
                 strategy.max_position = None if per_symbol_budget is not None else request.order_quantity
             self.auto_discovery = AutoDiscoveryConfig(
-                **request.model_dump(),
+                **effective_request.model_dump(),
                 enabled=True,
                 revision=expected_revision + 1,
                 managed_symbols=selected + retiring,
+                cash_base=cash_base,
+                allocation_weights=allocation_weights or {},
+                planner_reason=planner_reason,
+                planner_model=planner_model,
             )
             if start:
                 self.kill_switch = False

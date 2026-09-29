@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>토스 증권자동매매 · PAPER dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=14" />
+    <link rel="stylesheet" href="/static/styles.css?v=18" />
   </head>
   <body>
     <header class="topbar">
@@ -36,21 +36,29 @@
 
       <section class="card auto-discovery-card">
         <div class="section-heading"><div><p class="eyebrow">AUTOMATIC SELECTION · PAPER</p><h2>섹터 자동 발굴·매매</h2></div><span id="auto-discovery-state" class="pill">자동 발굴 꺼짐</span></div>
-        <p class="form-help auto-discovery-help">총 투자금액을 선정된 종목에 균등 배분하고, 주가·매수 수수료를 반영해 수량을 계산합니다. 후보는 5분마다 갱신하며, 시세 수집 후 이평선 매수 신호가 발생하면 PAPER 주문을 실행합니다.</p>
+        <p class="form-help auto-discovery-help">가용현금 중 투자할 비율만 선택하세요. AI가 섹터 후보의 종목 수와 투자 비중을 정하고, 주가·매수 수수료를 반영해 종목별로 분산 매수합니다. 이평선 매수 신호가 발생하면 PAPER 주문을 실행합니다.</p>
+        <div class="sector-keywords" role="group" aria-label="검색 가능한 섹터">
+          <button type="button" data-sector-keyword="반도체">반도체</button><button type="button" data-sector-keyword="냉각">냉각</button><button type="button" data-sector-keyword="의약">의약·바이오</button><button type="button" data-sector-keyword="우주">우주·위성</button><button type="button" data-sector-keyword="방산">방산</button><button type="button" data-sector-keyword="로봇">로봇</button><button type="button" data-sector-keyword="AI">AI</button><button type="button" data-sector-keyword="전력">전력</button><button type="button" data-sector-keyword="원전">원전·SMR</button><button type="button" data-sector-keyword="2차전지">2차전지·ESS</button><button type="button" data-sector-keyword="신재생">신재생·태양광</button><button type="button" data-sector-keyword="조선">조선</button>
+        </div>
         <form id="auto-discovery-form" class="auto-discovery-form">
-          <label>섹터 키워드<input id="auto-discovery-keyword" maxlength="80" placeholder="예: 데이터센터 냉각, 공조" required /></label>
+          <label>섹터 키워드<input id="auto-discovery-keyword" maxlength="80" placeholder="예: 의약, 우주, 로봇, 냉각" required /></label>
           <label>시장<select id="auto-discovery-market"><option value="KR">국내 주식</option><option value="US">미국 주식</option></select></label>
-          <label>최대 종목 수<select id="auto-discovery-count"><option value="1">1개</option><option value="2">2개</option><option value="3" selected>3개</option><option value="5">5개</option><option value="10">10개</option></select></label>
-          <label>투자 방식<select id="auto-discovery-sizing"><option value="budget">금액 균등 배분</option><option value="quantity">수량 직접 지정</option></select></label>
-          <label id="auto-discovery-budget-field">총 투자금액 (원)<input id="auto-discovery-budget" type="number" min="1" step="1" value="10000000" required /></label>
-          <label id="auto-discovery-quantity-field" hidden>종목별 1회 주문 수량<input id="auto-discovery-quantity" type="number" min="0.00000001" step="any" value="1" disabled /></label>
-          <div class="auto-discovery-actions"><button id="auto-discovery-start" class="button primary" type="submit">자동 발굴·매매 시작</button><button id="auto-discovery-stop" class="button warning" type="button">자동화 정지</button></div>
+          <label>가용현금 투자 비율<select id="auto-discovery-percentage"><option value="10" selected>10%</option><option value="20">20%</option><option value="30">30%</option><option value="40">40%</option><option value="50">50%</option><option value="60">60%</option><option value="70">70%</option><option value="80">80%</option><option value="90">90%</option><option value="100">100%</option></select></label>
+          <div class="auto-discovery-actions"><button id="auto-discovery-search" class="button ghost" type="submit" formnovalidate>섹터 검색</button><button id="auto-discovery-start" class="button primary" type="button">자동 발굴·매매 시작</button><button id="auto-discovery-stop" class="button warning" type="button">자동화 정지</button></div>
         </form>
-        <p class="form-help" id="auto-discovery-budget-help">금액 배분은 국내 주식 기준입니다. 기존 보유금액과 매수 수수료도 투자 한도에 포함하며, 1주를 살 수 없는 잔액은 현금으로 남깁니다.</p>
+        <p class="form-help">섹터 검색 또는 Enter는 조회만 합니다. 입력한 설정은 ‘자동 발굴·매매 시작’을 눌렀을 때 적용됩니다.</p>
+        <p class="form-help" id="auto-discovery-cash-preview" aria-live="polite">가용현금을 확인하고 있습니다.</p>
+        <p class="form-help" id="auto-discovery-planner-status" aria-live="polite">AI 배분 연결 상태를 확인하고 있습니다.</p>
+        <p class="form-help">비율 투자는 국내 주식 기준이며, 시작 시점의 가용현금으로 신규 투자 한도를 고정합니다. 매수 수수료를 포함하고 1주를 살 수 없는 잔액은 현금으로 남깁니다.</p>
+        <div id="auto-discovery-search-preview" class="sector-search-preview" hidden>
+          <p id="auto-discovery-search-summary" class="form-help" aria-live="polite"></p>
+          <div class="table-wrap"><table><thead><tr><th>검색 후보 종목</th><th>종목코드</th><th>현재가</th></tr></thead><tbody id="auto-discovery-search-results"></tbody></table></div>
+          <p class="form-help">검색 결과는 참고용 후보입니다. 자동매매 시작 시 거래대금 조건에 따라 종목을 선정합니다.</p>
+        </div>
         <p id="auto-discovery-summary" class="auto-discovery-summary" aria-live="polite">자동 발굴을 시작하면 종목 선정과 전략 실행이 이어집니다.</p>
         <div id="allocation-preview" class="allocation-preview" hidden>
           <p id="allocation-summary" class="form-help"></p>
-          <div class="table-wrap"><table class="allocation-table"><thead><tr><th>선정 종목</th><th>배분 한도</th><th>추가 매수 예상</th><th>예상 금액·매수 수수료 포함</th></tr></thead><tbody id="allocation-body"></tbody></table></div>
+          <div class="table-wrap"><table class="allocation-table"><thead><tr><th>선정 종목</th><th>신규 투자 비중</th><th>배분 한도</th><th>추가 매수 예상</th><th>예상 금액·매수 수수료 포함</th></tr></thead><tbody id="allocation-body"></tbody></table></div>
           <p class="form-help">예상 수량은 현재 시세 기준이며 주문 직전에 다시 계산합니다. 매수 신호가 없는 종목은 현금으로 대기하고, 기존 보유분은 자동으로 비중 조정 매도하지 않습니다.</p>
         </div>
       </section>
@@ -76,21 +84,6 @@
         </div>
         <p id="investment-help" class="investment-help">보유 종목을 불러오는 중입니다.</p>
       </section>
-
-      <details class="manual-search-details">
-        <summary>수동 섹터·종목 검색</summary>
-      <section class="card volume-search-card">
-        <div class="section-heading"><div><p class="eyebrow">STOCK SEARCH</p><h2>&#xC885;&#xBAA9; &#xAC80;&#xC0C9;</h2></div><span id="volume-ranked-at" class="pill">&#xAC80;&#xC0C9; &#xC804;</span></div>
-        <p class="form-help volume-search-help">회사 공개 사업·제품 자료를 앱 내부 종목 프로필과 대조해 검색합니다. 관련 산업은 공식 업종분류가 아닌 참고용 분류이며, 종목별 출처 링크에서 근거를 확인하세요. 예: 냉각, 애플, KB금융, AAPL, 105560</p>
-        <form id="volume-search-form" class="volume-search-form">
-          <label>&#xC0B0;&#xC5C5; &#xD0A4;&#xC6CC;&#xB4DC; / &#xC885;&#xBAA9;&#xBA85; / &#xCF54;&#xB4DC;<input id="volume-keyword" placeholder="&#xC608;: &#xB0C9;&#xAC01;, &#xC560;&#xD50C;, KB&#xAE08;&#xC735;, AAPL, 105560" required /></label>
-          <label>&#xC2DC;&#xC7A5;<select id="volume-market"><option value="KR">&#xAD6D;&#xB0B4; &#xC8FC;&#xC2DD;</option><option value="US">&#xBBF8;&#xAD6D; &#xC8FC;&#xC2DD;</option></select></label>
-          <button class="button primary" type="submit">&#xAC80;&#xC0C9;</button>
-        </form>
-        <div class="table-wrap"><table class="related-table"><thead><tr><th>&#xC885;&#xBAA9;&#xBA85;</th><th>&#xC885;&#xBAA9;&#xCF54;&#xB4DC;</th><th>&#xD604;&#xC7AC;&#xAC00;</th><th>&#xAD00;&#xB828;&#xB3C4;</th><th>&#xAD00;&#xB828; &#xC0B0;&#xC5C5; / &#xD14C;&#xB9C8;</th><th>&#xAD00;&#xB828; &#xC774;&#xC720;</th><th></th></tr></thead><tbody id="volume-results"><tr><td colspan="7" class="empty">&#xC0B0;&#xC5C5; &#xD0A4;&#xC6CC;&#xB4DC;&#xB97C; &#xC785;&#xB825;&#xD574; &#xAC80;&#xC0C9;&#xD558;&#xC138;&#xC694;.</td></tr></tbody></table></div>
-        <button data-control="resume" class="button ghost" type="button">담은 종목 실행</button>
-      </section>
-      </details>
 
     </main>
 
@@ -122,6 +115,6 @@
 
     <footer>Automatic Trader v0.2 · 실계좌 주문 API는 비활성화되어 있습니다.</footer>
     <script src="/static/investment_chart.js?v=5"></script>
-    <script src="/static/app.js?v=21"></script>
+    <script src="/static/app.js?v=25"></script>
   </body>
 </html>

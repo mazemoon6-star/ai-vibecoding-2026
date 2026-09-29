@@ -164,10 +164,11 @@ class AutoDiscoveryRequest(BaseModel):
     max_symbols: int = Field(default=3, ge=1, le=10)
     order_quantity: Decimal = Field(default=Decimal("1"), gt=0)
     total_investment: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=2)
+    cash_percentage: int | None = Field(default=None, ge=10, le=100, multiple_of=10)
 
     @model_validator(mode="after")
     def validate_budget_market(self) -> "AutoDiscoveryRequest":
-        if self.total_investment is not None and self.market != "KR":
+        if (self.total_investment is not None or self.cash_percentage is not None) and self.market != "KR":
             raise ValueError("금액 기준 분산투자는 국내 주식(KR)에서 지원합니다.")
         return self
 
@@ -187,6 +188,10 @@ class AutoDiscoveryConfig(AutoDiscoveryRequest):
     enabled: bool = False
     revision: int = Field(default=0, ge=0)
     managed_symbols: list[str] = Field(default_factory=list)
+    cash_base: Decimal | None = Field(default=None, ge=0)
+    allocation_weights: dict[str, Decimal] = Field(default_factory=dict)
+    planner_reason: str = ""
+    planner_model: str | None = None
 
     @field_validator("keyword")
     @classmethod

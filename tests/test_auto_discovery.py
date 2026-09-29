@@ -3,12 +3,14 @@ from decimal import Decimal
 import unittest
 import httpx
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from auto_trader import app as dashboard
 from auto_trader.models import AutoDiscoveryRequest, AutoStrategySymbolRequest, OrderRequest, TickRequest
 from auto_trader.paper_engine import EngineError, PaperEngine
 from auto_trader.paper_state import dump_engine, restore_engine
+from auto_trader.investment_planner import InvestmentPlan
+from auto_trader.trading_assistant import TradingAssistantError
 from auto_trader.toss_client import TossApiError
 
 
@@ -64,6 +66,28 @@ class AutoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         for strategy in self.engine.strategies.values():
             self.assertEqual(strategy.max_position, Decimal("2"))
         self.assertEqual({item["status"] for item in result["selected"]}, {"시세 수집 중"})
+
+    async def test_new_sector_profiles_can_start_budget_auto_discovery(self):
+        from auto_trader.related_stock_search import search_related_stocks
+
+        for keyword, symbols in (
+            ("의약", ["207940", "068270"]),
+            ("우주", ["012450", "099320"]),
+            ("로봇", ["454910", "277810"]),
+        ):
+            with self.subTest(keyword=keyword), patch.object(dashboard, "search_related_stocks", search_related_stocks):
+                self.client.get_market_rankings.return_value = {"rankings": [
+                    {"symbol": "UNRELATED", "rank": 0},
+                    *[{"symbol": symbol, "rank": rank} for rank, symbol in enumerate(symbols, 1)]
+                ]}
+                result = await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+                    keyword=keyword, market="KR", max_symbols=5, total_investment=Decimal("6000")
+                ))
+                self.assertEqual(result["config"]["keyword"], keyword)
+                self.assertEqual(result["status"]["selected_symbols"], symbols)
+                self.assertEqual([item["budget"] for item in result["allocation"]["items"]], [Decimal("3000")] * 2)
+                self.assertTrue(self.engine.trading_enabled)
+                self.assertEqual(len(self.engine.orders), 0)
 
     async def test_rotation_blocks_old_entries_preserves_exits_and_removes_flat_stocks(self):
         await dashboard.start_auto_discovery(self.request)
@@ -188,6 +212,97 @@ class AutoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.update_tick(TickRequest(symbol="TEST", price=80))
         self.assertEqual(self.engine.orders[pending["order_id"]].status, "PENDING")
         self.assertNotIn("TEST", self.engine.positions)
+
+    async def test_searching_other_sector_preserves_active_selection_and_periodic_scan_keyword(self):
+        cooling_candidates = self.candidates
+        semiconductor_candidates = [{"symbol": "083450", "name": "GST", "relevance_score": 80}]
+        search = Mock(side_effect=lambda keyword, *args, **kwargs:
+            cooling_candidates if keyword == "냉각" else semiconductor_candidates)
+        with patch.object(dashboard, "search_related_stocks", search):
+            await dashboard.start_auto_discovery(self.request.model_copy(update={
+                "total_investment": Decimal("6000")
+            }))
+            before = dump_engine(self.engine)
+            allocation = await self.engine.auto_allocation_snapshot()
+            self.client.get_market_rankings.reset_mock()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=dashboard.app), base_url="http://test"
+            ) as client:
+                response = await client.get("/api/v1/market/related-stocks", params={
+                    "keyword": "반도체", "market": "KR"
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual([item["symbol"] for item in response.json()["items"]], ["083450"])
+                self.assertEqual(dump_engine(self.engine), before)
+                self.assertEqual(await self.engine.auto_allocation_snapshot(), allocation)
+                self.client.get_market_rankings.assert_not_awaited()
+                await dashboard._scan_auto_discovery()
+                self.assertEqual(search.call_args.args[0], "냉각")
+                status = (await client.get("/api/v1/auto-discovery")).json()
+                self.assertEqual(status["keyword"], "냉각")
+                self.assertEqual(status["selected_symbols"], ["066570", "083450"])
+                self.assertEqual(await self.engine.auto_allocation_snapshot(), allocation)
+
+    async def test_cash_ratio_http_uses_ai_count_and_weights_and_keeps_budget_on_rescan(self):
+        symbols = ["066570", "083450", "053080", "000100"]
+        self.candidates.append({"symbol": "000100", "name": "유한양행", "relevance_score": 80})
+        self.client.get_market_rankings.return_value = {"rankings": [
+            {"symbol": symbol, "rank": rank} for rank, symbol in enumerate(symbols, 1)
+        ]}
+        plan = InvestmentPlan(items=[{"symbol": symbol, "weight_percent": 25} for symbol in symbols], reason="4종목 분산")
+        planner = SimpleNamespace(configured=True, model="gpt-test", plan=AsyncMock(return_value=plan),
+            status=lambda: {"configured": True, "model": "gpt-test"})
+        with patch.object(dashboard, "investment_planner", planner):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=dashboard.app), base_url="http://test") as client:
+                started = await client.post("/api/v1/auto-discovery/start", json={
+                    "keyword": "냉각", "cash_percentage": 30, "max_symbols": 1
+                })
+                self.assertEqual(started.status_code, 200)
+                self.assertEqual(started.json()["status"]["selected_symbols"], symbols)
+                self.assertEqual(started.json()["config"]["total_investment"], "3000.00")
+                self.assertEqual(planner.plan.call_args.args[0]["new_investment_budget"], Decimal("3000"))
+                await self.engine.place_order(OrderRequest(symbol="066570", side="BUY", quantity=5))
+                await dashboard._scan_auto_discovery()
+                self.assertEqual(planner.plan.call_args.args[0]["new_investment_budget"], Decimal("2500"))
+                status = (await client.get("/api/v1/auto-discovery")).json()
+                self.assertEqual(status["cash_percentage"], 30)
+                self.assertEqual(Decimal(status["total_investment"]), Decimal("3000"))
+                self.assertEqual(Decimal(status["cash_base"]), Decimal("10000"))
+                self.assertEqual(status["planner_model"], "gpt-test")
+
+    async def test_missing_ai_key_or_interrupted_ai_plan_cannot_replace_selection(self):
+        await dashboard.start_auto_discovery(self.request)
+        before = dump_engine(self.engine)
+        with patch.object(dashboard, "investment_planner", SimpleNamespace(configured=False)):
+            with self.assertRaises(TradingAssistantError):
+                await dashboard.start_auto_discovery(AutoDiscoveryRequest(keyword="의약", cash_percentage=30))
+        self.assertEqual(dump_engine(self.engine), before)
+
+        async def stop_then_plan(context):
+            await dashboard.stop_auto_discovery()
+            return InvestmentPlan(items=[{"symbol": "066570", "weight_percent": 100}], reason="의약")
+
+        planner = SimpleNamespace(configured=True, model="gpt-test", plan=stop_then_plan)
+        with patch.object(dashboard, "investment_planner", planner), self.assertRaises(EngineError):
+            await dashboard.start_auto_discovery(AutoDiscoveryRequest(keyword="의약", cash_percentage=30))
+        self.assertFalse(self.engine.auto_discovery.enabled)
+        self.assertFalse(self.engine.trading_enabled)
+        self.assertEqual(self.engine.auto_discovery.keyword, "냉각")
+
+    async def test_ai_refresh_failure_does_not_skip_existing_strategy_quote_polling(self):
+        await dashboard.start_auto_discovery(self.request)
+        self.client.get_prices.reset_mock()
+        run_strategies = AsyncMock()
+        with patch.object(dashboard, "auto_discovery_last_attempt", None), patch.object(
+            dashboard, "_scan_auto_discovery", AsyncMock(side_effect=TradingAssistantError(
+                "planner_network_error", "AI 연결 실패", 503
+            ))
+        ), patch.object(self.engine, "run_strategies", run_strategies), patch.object(
+            dashboard.asyncio, "sleep", AsyncMock(side_effect=asyncio.CancelledError)
+        ), self.assertLogs(dashboard.logger, level="WARNING"), self.assertRaises(asyncio.CancelledError):
+            await dashboard._market_data_monitor()
+        self.client.get_prices.assert_awaited_once_with(["066570", "083450"])
+        run_strategies.assert_awaited_once()
 
 
 if __name__ == "__main__":
