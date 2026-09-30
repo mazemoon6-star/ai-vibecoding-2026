@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>토스 증권자동매매 · PAPER dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css?v=18" />
+    <link rel="stylesheet" href="/static/styles.css?v=19" />
   </head>
   <body>
     <header class="topbar">
@@ -87,34 +87,8 @@
 
     </main>
 
-    <button id="assistant-toggle" class="assistant-launcher" type="button" aria-controls="assistant-panel" aria-expanded="false">
-      <span class="assistant-launcher-icon" aria-hidden="true">✦</span>
-      <span>AI 매매 도우미</span>
-    </button>
-    <aside id="assistant-panel" class="assistant-panel" role="dialog" aria-modal="false" aria-labelledby="assistant-heading" hidden>
-      <header class="assistant-header">
-        <div><p class="eyebrow">READ-ONLY · PAPER</p><h2 id="assistant-heading">AI 매매 도우미</h2></div>
-        <div class="assistant-header-actions"><span id="assistant-status" class="assistant-status">연결 확인 중</span><button id="assistant-close" class="assistant-close" type="button" aria-label="AI 매매 도우미 닫기">×</button></div>
-      </header>
-      <p class="assistant-safety">현재 PAPER 계좌를 읽어 설명합니다. 주문을 실행하거나 설정을 변경하지 않습니다.</p>
-      <div id="assistant-messages" class="assistant-messages" aria-live="polite">
-        <div class="assistant-message assistant-message-bot">안녕하세요. 계좌 현황, 보유 종목, 손익 또는 자동매매 전략 상태를 물어보세요.</div>
-      </div>
-      <div class="assistant-suggestions" aria-label="추천 질문">
-        <button type="button" data-assistant-prompt="현재 계좌 현황을 요약해 주세요.">계좌 요약</button>
-        <button type="button" data-assistant-prompt="보유 종목별 손익과 위험 요인을 설명해 주세요.">보유 종목</button>
-        <button type="button" data-assistant-prompt="현재 자동매매 전략 상태를 설명해 주세요.">전략 상태</button>
-      </div>
-      <form id="assistant-form" class="assistant-form">
-        <label class="sr-only" for="assistant-input">AI 매매 도우미에게 질문</label>
-        <textarea id="assistant-input" rows="2" maxlength="2000" placeholder="예: 현재 손익을 쉽게 설명해 주세요" required></textarea>
-        <button id="assistant-send" class="assistant-send" type="submit">전송</button>
-      </form>
-      <p class="assistant-disclaimer">AI 답변은 참고용이며 미래 수익을 보장하지 않습니다.</p>
-    </aside>
-
     <footer>Automatic Trader v0.2 · 실계좌 주문 API는 비활성화되어 있습니다.</footer>
     <script src="/static/investment_chart.js?v=5"></script>
-    <script src="/static/app.js?v=25"></script>
+    <script src="/static/app.js?v=28"></script>
   </body>
 </html>

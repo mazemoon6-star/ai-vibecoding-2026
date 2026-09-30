@@ -76,8 +76,8 @@ function renderAutoDiscovery(discovery, items, configured) {
   }
   investmentPlannerReady = Boolean(discovery.planner?.configured);
   $("#auto-discovery-planner-status").textContent = investmentPlannerReady
-    ? "AI 자동 배분 사용 가능 · " + discovery.planner.model
-    : "AI 자동 배분: 서버 .env에 OPENAI_API_KEY를 설정하고 서버를 다시 시작하세요. 섹터 검색은 사용할 수 있습니다.";
+    ? "AI 자동 배분 사용 가능 · OpenAI · " + discovery.planner.model
+    : (discovery.planner?.message || "OpenAI 설정을 확인하세요.") + " 섹터 검색은 사용할 수 있습니다.";
   updateInvestmentPreview();
   const state = $("#auto-discovery-state");
   const running = discovery.enabled && discovery.trading_enabled;
@@ -237,7 +237,7 @@ $("#auto-discovery-start").addEventListener("click", async () => {
     if ($("#auto-discovery-market").value !== "KR") {
       throw new Error("가용현금 비율 투자는 국내 주식에서 지원합니다.");
     }
-    if (!investmentPlannerReady) throw new Error("AI 자동 배분을 사용하려면 서버 .env에 OPENAI_API_KEY를 설정하고 서버를 다시 시작하세요.");
+    if (!investmentPlannerReady) throw new Error("AI 자동 배분을 사용하려면 서버 .env의 OpenAI 설정을 확인하고 서버를 다시 시작하세요.");
     const result = await api("/api/v1/auto-discovery/start", {
       method: "POST",
       body: JSON.stringify({
@@ -267,97 +267,5 @@ $("#auto-discovery-stop").addEventListener("click", async (event) => {
     await refresh();
   }
 });
-const assistantHistory = [];
-let assistantConfigured = false;
-let assistantBusy = false;
-
-function appendAssistantMessage(role, message, extraClass = "") {
-  const element = document.createElement("div");
-  element.className = `assistant-message assistant-message-${role}${extraClass ? ` ${extraClass}` : ""}`;
-  element.textContent = message;
-  $("#assistant-messages").appendChild(element);
-  $("#assistant-messages").scrollTop = $("#assistant-messages").scrollHeight;
-  return element;
-}
-
-function setAssistantEnabled(enabled) {
-  assistantConfigured = enabled;
-  $("#assistant-input").disabled = !enabled;
-  $("#assistant-send").disabled = !enabled;
-  document.querySelectorAll("[data-assistant-prompt]").forEach((button) => { button.disabled = !enabled; });
-}
-
-async function initializeAssistant() {
-  try {
-    const status = await api("/api/v1/assistant/status");
-    const statusElement = $("#assistant-status");
-    statusElement.textContent = status.configured ? "사용 가능" : "API 키 필요";
-    statusElement.classList.toggle("ready", status.configured);
-    statusElement.classList.toggle("error", !status.configured);
-    setAssistantEnabled(status.configured);
-    if (!status.configured) {
-      appendAssistantMessage("bot", "서버의 .env에 OPENAI_API_KEY를 설정하고 앱을 다시 시작하면 채팅을 사용할 수 있습니다.", "assistant-message-error");
-    }
-  } catch (error) {
-    $("#assistant-status").textContent = "연결 실패";
-    $("#assistant-status").classList.add("error");
-    setAssistantEnabled(false);
-  }
-}
-
-function setAssistantOpen(open) {
-  $("#assistant-panel").hidden = !open;
-  $("#assistant-toggle").setAttribute("aria-expanded", String(open));
-  if (open && assistantConfigured) $("#assistant-input").focus();
-}
-
-async function sendAssistantMessage(rawMessage) {
-  const message = rawMessage.trim();
-  if (!message || !assistantConfigured || assistantBusy) return;
-  const previousHistory = assistantHistory.slice(-10);
-  assistantHistory.push({ role: "user", content: message });
-  appendAssistantMessage("user", message);
-  assistantBusy = true;
-  $("#assistant-send").disabled = true;
-  $("#assistant-input").disabled = true;
-  const thinking = appendAssistantMessage("bot", "답변을 준비하고 있습니다…", "assistant-message-thinking");
-  try {
-    const result = await api("/api/v1/assistant/chat", {
-      method: "POST",
-      body: JSON.stringify({ message, history: previousHistory })
-    });
-    thinking.remove();
-    assistantHistory.push({ role: "assistant", content: result.reply });
-    if (assistantHistory.length > 12) assistantHistory.splice(0, assistantHistory.length - 12);
-    appendAssistantMessage("bot", result.reply);
-  } catch (error) {
-    thinking.remove();
-    appendAssistantMessage("bot", error.message, "assistant-message-error");
-  } finally {
-    assistantBusy = false;
-    $("#assistant-send").disabled = false;
-    $("#assistant-input").disabled = false;
-    $("#assistant-input").focus();
-  }
-}
-
-$("#assistant-toggle").addEventListener("click", () => setAssistantOpen($("#assistant-panel").hidden));
-$("#assistant-close").addEventListener("click", () => setAssistantOpen(false));
-$("#assistant-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const message = $("#assistant-input").value;
-  $("#assistant-input").value = "";
-  await sendAssistantMessage(message);
-});
-$("#assistant-input").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
-    event.preventDefault();
-    $("#assistant-form").requestSubmit();
-  }
-});
-document.querySelectorAll("[data-assistant-prompt]").forEach((button) => button.addEventListener("click", () => sendAssistantMessage(button.dataset.assistantPrompt)));
-document.addEventListener("keydown", (event) => { if (event.key === "Escape") setAssistantOpen(false); });
-
 refresh();
-initializeAssistant();
 setInterval(refresh, 5000);

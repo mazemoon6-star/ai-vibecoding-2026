@@ -17,12 +17,11 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import TossConfig, load_local_env
 from .instruments import instrument_name
-from .investment_planner import InvestmentPlannerClient
-from .models import AssistantChatRequest, AutoDiscoveryRequest, AutoStrategyResumeRequest, AutoStrategySettings, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderStatus, StrategyRequest, TickRequest
+from .investment_planner import InvestmentPlannerClient, InvestmentPlannerError
+from .models import AutoDiscoveryRequest, AutoStrategyResumeRequest, AutoStrategySettings, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderStatus, StrategyRequest, TickRequest
 from .paper_engine import EngineError, PaperEngine
 from .related_stock_search import expand_keyword, search_direct_stocks, search_related_stocks
 from .toss_client import TossApiError, TossClient
-from .trading_assistant import TradingAssistantClient, TradingAssistantError
 
 
 load_local_env()
@@ -45,7 +44,6 @@ engine = PaperEngine(
 )
 toss_config = TossConfig.from_env()
 toss_client = TossClient(toss_config)
-trading_assistant = TradingAssistantClient()
 investment_planner = InvestmentPlannerClient()
 STATIC_DIR = Path(__file__).parent / "static"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -111,7 +109,7 @@ async def _scan_auto_discovery(
         auto_discovery_status.update(last_attempt_at=auto_discovery_last_attempt, scanning=True)
         try:
             return await _apply_auto_discovery_scan(request, int(config["revision"]), start=start)
-        except (TossApiError, EngineError, TradingAssistantError) as exc:
+        except (TossApiError, EngineError, InvestmentPlannerError) as exc:
             auto_discovery_status["error"] = exc.message
             raise
         finally:
@@ -125,8 +123,10 @@ async def _apply_auto_discovery_scan(
 
     if not toss_client.configured:
         raise TossApiError("toss_not_configured", "자동 발굴에는 토스 시세 연동 설정이 필요합니다.", 503)
-    if request.cash_percentage is not None and not investment_planner.configured:
-        raise TradingAssistantError("openai_not_configured", "AI 자동 배분을 사용하려면 서버 .env에 OPENAI_API_KEY를 설정하고 서버를 다시 시작하세요.", 503)
+    if request.cash_percentage is not None:
+        planner_status = await investment_planner.status()
+        if not planner_status["configured"]:
+            raise InvestmentPlannerError("ai_not_ready", str(planner_status["message"]), 503)
 
     direct_candidates = search_direct_stocks(request.keyword, request.market, limit=20)
     candidates = direct_candidates or search_related_stocks(
@@ -245,7 +245,7 @@ async def _market_data_monitor() -> None:
                 ):
                     try:
                         await _scan_auto_discovery()
-                    except (TossApiError, EngineError, TradingAssistantError) as exc:
+                    except (TossApiError, EngineError, InvestmentPlannerError) as exc:
                         logger.warning("PAPER auto-discovery scan failed: %s", getattr(exc, "code", "scan_error"))
             positions = [position for position in await engine.positions_snapshot() if position["quantity"] > 0]
             symbols = list(dict.fromkeys(
@@ -350,8 +350,8 @@ async def toss_error_handler(_: Request, exc: TossApiError) -> JSONResponse:
     )
 
 
-@app.exception_handler(TradingAssistantError)
-async def trading_assistant_error_handler(_: Request, exc: TradingAssistantError) -> JSONResponse:
+@app.exception_handler(InvestmentPlannerError)
+async def investment_planner_error_handler(_: Request, exc: InvestmentPlannerError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.code, "message": exc.message, "data": None}},
@@ -398,35 +398,6 @@ async def broker_status() -> dict[str, object]:
 @app.get("/api/v1/account")
 async def account() -> dict[str, object]:
     return await engine.account()
-
-
-@app.get("/api/v1/assistant/status")
-async def assistant_status() -> dict[str, object]:
-    """Report capability without exposing the OpenAI API key."""
-
-    return trading_assistant.status()
-
-
-@app.post("/api/v1/assistant/chat")
-async def assistant_chat(request: AssistantChatRequest) -> dict[str, object]:
-    """Answer against a read-only snapshot of the current PAPER account."""
-
-    def without_windows(items: list[dict[str, object]]) -> list[dict[str, object]]:
-        return [
-            {key: value for key, value in item.items() if key not in {"short_window", "long_window"}}
-            for item in items
-        ]
-
-    snapshot = {
-        "captured_at": datetime.now(timezone.utc),
-        "account": await engine.account(),
-        "positions": await engine.positions_snapshot(),
-        "orders": (await engine.orders_snapshot())[-20:],
-        "auto_trade_symbols": without_windows(await engine.auto_watchlist_snapshot()),
-        "strategies": without_windows(await engine.list_strategies()),
-    }
-    reply = await trading_assistant.respond(request, snapshot)
-    return {"reply": reply, "model": trading_assistant.model, "read_only": True}
 
 
 @app.get("/api/v1/positions")
@@ -646,7 +617,7 @@ async def get_auto_discovery() -> dict[str, object]:
         "selected_symbols": [item["symbol"] for item in managed if item["entry_enabled"]],
         "retiring_symbols": [item["symbol"] for item in managed if not item["entry_enabled"]],
         "allocation": await engine.auto_allocation_snapshot(),
-        "planner": investment_planner.status(),
+        "planner": await investment_planner.status(),
     }
 
 

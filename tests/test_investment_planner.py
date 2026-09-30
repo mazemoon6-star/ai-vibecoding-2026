@@ -3,8 +3,7 @@ import unittest
 
 import httpx
 
-from auto_trader.investment_planner import InvestmentPlannerClient
-from auto_trader.trading_assistant import TradingAssistantError
+from auto_trader.investment_planner import InvestmentPlannerClient, InvestmentPlannerError
 
 
 class InvestmentPlannerTests(unittest.IsolatedAsyncioTestCase):
@@ -37,14 +36,34 @@ class InvestmentPlannerTests(unittest.IsolatedAsyncioTestCase):
             [{"symbol": "207940", "weight_percent": 100.0}],
             [],
         ):
-            with self.subTest(items=items), self.assertRaises(TradingAssistantError):
+            with self.subTest(items=items), self.assertRaises(InvestmentPlannerError):
                 await self.client({"items": items, "reason": "분산"}).plan(self.context())
-        with self.assertRaises(TradingAssistantError):
+        with self.assertRaises(InvestmentPlannerError):
             await self.client({"items": [{"symbol": "207940", "weight_percent": 100}],
                 "reason": "분산"}, status="incomplete").plan(self.context())
 
     async def test_no_key_fails_without_a_network_call(self):
         client = InvestmentPlannerClient(api_key="")
-        with self.assertRaises(TradingAssistantError) as error:
+        with self.assertRaises(InvestmentPlannerError) as error:
             await client.plan(self.context())
         self.assertEqual(error.exception.code, "openai_not_configured")
+
+    async def test_blank_model_disables_planner_before_network_call(self):
+        client = InvestmentPlannerClient(api_key="sk-test", model="")
+        status = await client.status()
+        self.assertFalse(status["configured"])
+        self.assertIn("OPENAI_MODEL", status["message"])
+        with self.assertRaises(InvestmentPlannerError) as error:
+            await client.plan(self.context())
+        self.assertEqual(error.exception.code, "openai_not_configured")
+
+    async def test_malformed_response_is_rejected_safely(self):
+        client = InvestmentPlannerClient(
+            api_key="sk-test",
+            transport=httpx.MockTransport(lambda request: httpx.Response(
+                200, json={"status": "completed", "output": [{"type": "message", "content": None}]}
+            )),
+        )
+        with self.assertRaises(InvestmentPlannerError) as error:
+            await client.plan(self.context())
+        self.assertEqual(error.exception.code, "invalid_investment_plan")

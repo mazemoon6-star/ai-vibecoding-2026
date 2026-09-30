@@ -86,7 +86,6 @@ async function fixture() {
         { symbol: "066570", name: "LG전자" }, { symbol: "083450", name: "GST" }
       ] };
       else if (path === "/api/v1/broker/status") body = { market_data: { enabled: true, credentials_configured: true } };
-      else if (path === "/api/v1/assistant/status") body = { configured: false };
       else body = {};
       return { ok, status: ok ? 200 : 503, json: async () => JSON.parse(JSON.stringify(body)) };
     }
@@ -188,12 +187,13 @@ test("cash allocation uses only 10-percent steps and sends no count, fixed amoun
   assert.deepEqual(body, { keyword: "우주", market: "KR", cash_percentage: 30 });
 });
 
-test("missing AI configuration disables start but allows sector search", async () => {
+test("missing OpenAI key disables start but allows sector search", async () => {
   const { find, state, calls, context, editKeyword } = await fixture();
   state.planner.configured = false;
+  state.planner.message = "OpenAI 키가 설정되지 않았습니다.";
   await context.refresh();
   assert.equal(find("#auto-discovery-start").disabled, true);
-  assert.match(find("#auto-discovery-planner-status").textContent, /OPENAI_API_KEY/);
+  assert.match(find("#auto-discovery-planner-status").textContent, /OpenAI/);
   await editKeyword("의약");
   await find("#auto-discovery-form").emit("submit");
   assert.match(find("#auto-discovery-search-summary").textContent, /의약/);

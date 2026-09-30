@@ -281,25 +281,3 @@ class ApiError(BaseModel):
     code: str
     message: str
     data: dict[str, Any] | None = None
-
-
-class AssistantHistoryMessage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=4000)
-
-
-class AssistantChatRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    message: str = Field(min_length=1, max_length=2000)
-    history: list[AssistantHistoryMessage] = Field(default_factory=list, max_length=12)
-
-    @field_validator("message")
-    @classmethod
-    def normalize_message(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("message must not be blank")
-        return value

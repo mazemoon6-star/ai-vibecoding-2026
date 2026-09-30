@@ -9,8 +9,7 @@ from auto_trader import app as dashboard
 from auto_trader.models import AutoDiscoveryRequest, AutoStrategySymbolRequest, OrderRequest, TickRequest
 from auto_trader.paper_engine import EngineError, PaperEngine
 from auto_trader.paper_state import dump_engine, restore_engine
-from auto_trader.investment_planner import InvestmentPlan
-from auto_trader.trading_assistant import TradingAssistantError
+from auto_trader.investment_planner import InvestmentPlan, InvestmentPlannerError
 from auto_trader.toss_client import TossApiError
 
 
@@ -251,7 +250,7 @@ class AutoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         ]}
         plan = InvestmentPlan(items=[{"symbol": symbol, "weight_percent": 25} for symbol in symbols], reason="4종목 분산")
         planner = SimpleNamespace(configured=True, model="gpt-test", plan=AsyncMock(return_value=plan),
-            status=lambda: {"configured": True, "model": "gpt-test"})
+            status=AsyncMock(return_value={"configured": True, "model": "gpt-test", "provider": "test"}))
         with patch.object(dashboard, "investment_planner", planner):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=dashboard.app), base_url="http://test") as client:
                 started = await client.post("/api/v1/auto-discovery/start", json={
@@ -273,8 +272,11 @@ class AutoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_ai_key_or_interrupted_ai_plan_cannot_replace_selection(self):
         await dashboard.start_auto_discovery(self.request)
         before = dump_engine(self.engine)
-        with patch.object(dashboard, "investment_planner", SimpleNamespace(configured=False)):
-            with self.assertRaises(TradingAssistantError):
+        planner_missing = SimpleNamespace(status=AsyncMock(return_value={
+            "configured": False, "provider": "openai", "model": "gpt-test", "message": "OpenAI 키가 없습니다."
+        }))
+        with patch.object(dashboard, "investment_planner", planner_missing):
+            with self.assertRaises(InvestmentPlannerError):
                 await dashboard.start_auto_discovery(AutoDiscoveryRequest(keyword="의약", cash_percentage=30))
         self.assertEqual(dump_engine(self.engine), before)
 
@@ -282,7 +284,8 @@ class AutoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             await dashboard.stop_auto_discovery()
             return InvestmentPlan(items=[{"symbol": "066570", "weight_percent": 100}], reason="의약")
 
-        planner = SimpleNamespace(configured=True, model="gpt-test", plan=stop_then_plan)
+        planner = SimpleNamespace(configured=True, model="gpt-test", plan=stop_then_plan,
+            status=AsyncMock(return_value={"configured": True, "provider": "test", "model": "gpt-test"}))
         with patch.object(dashboard, "investment_planner", planner), self.assertRaises(EngineError):
             await dashboard.start_auto_discovery(AutoDiscoveryRequest(keyword="의약", cash_percentage=30))
         self.assertFalse(self.engine.auto_discovery.enabled)
@@ -294,7 +297,7 @@ class AutoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.client.get_prices.reset_mock()
         run_strategies = AsyncMock()
         with patch.object(dashboard, "auto_discovery_last_attempt", None), patch.object(
-            dashboard, "_scan_auto_discovery", AsyncMock(side_effect=TradingAssistantError(
+            dashboard, "_scan_auto_discovery", AsyncMock(side_effect=InvestmentPlannerError(
                 "planner_network_error", "AI 연결 실패", 503
             ))
         ), patch.object(self.engine, "run_strategies", run_strategies), patch.object(
