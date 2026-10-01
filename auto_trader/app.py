@@ -6,7 +6,7 @@ import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
@@ -15,10 +15,11 @@ from fastapi import Body, FastAPI, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .allocation_rules import liquidity_price_weights
 from .config import TossConfig, load_local_env
 from .instruments import instrument_name
 from .investment_planner import InvestmentPlannerClient, InvestmentPlannerError
-from .models import AutoDiscoveryRequest, AutoStrategyResumeRequest, AutoStrategySettings, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderStatus, StrategyRequest, TickRequest
+from .models import AutoDiscoveryRequest, AutoStrategyResumeRequest, AutoStrategySettings, AutoStrategySymbolRequest, MarketSyncRequest, OrderRequest, OrderSide, OrderStatus, StrategyRequest, TickRequest
 from .paper_engine import EngineError, PaperEngine
 from .related_stock_search import expand_keyword, search_direct_stocks, search_related_stocks
 from .toss_client import TossApiError, TossClient
@@ -103,7 +104,7 @@ async def _scan_auto_discovery(
             return []
         if request is None:
             request = AutoDiscoveryRequest.model_validate({
-                key: config[key] for key in ("keyword", "market", "max_symbols", "order_quantity", "total_investment", "cash_percentage")
+                key: config[key] for key in ("keyword", "market", "max_symbols", "order_quantity", "total_investment", "cash_percentage", "chosen_symbols")
             })
         auto_discovery_last_attempt = datetime.now(timezone.utc)
         auto_discovery_status.update(last_attempt_at=auto_discovery_last_attempt, scanning=True)
@@ -123,45 +124,52 @@ async def _apply_auto_discovery_scan(
 
     if not toss_client.configured:
         raise TossApiError("toss_not_configured", "자동 발굴에는 토스 시세 연동 설정이 필요합니다.", 503)
-    if request.cash_percentage is not None:
+    if request.cash_percentage is not None and request.chosen_symbols is None:
         planner_status = await investment_planner.status()
         if not planner_status["configured"]:
             raise InvestmentPlannerError("ai_not_ready", str(planner_status["message"]), 503)
 
-    direct_candidates = search_direct_stocks(request.keyword, request.market, limit=20)
+    manual_selection = request.chosen_symbols is not None
+    direct_candidates = search_direct_stocks(request.keyword, request.market, limit=5 if manual_selection else 20)
     candidates = direct_candidates or search_related_stocks(
-        request.keyword, request.market, limit=100
+        request.keyword, request.market, limit=5 if manual_selection else 100
     )
     candidates_by_symbol = {
         str(item["symbol"]).strip().upper(): item
         for item in candidates
         if item.get("symbol")
-        and (direct_candidates or int(item.get("relevance_score", 0)) >= 25)
+        and (manual_selection or direct_candidates or int(item.get("relevance_score", 0)) >= 25)
     }
     if not candidates_by_symbol:
         raise EngineError("no_sector_candidates", "입력한 섹터와 일치하는 종목을 찾지 못했습니다.", 422)
 
-    ranking = await toss_client.get_market_rankings(request.market, "MARKET_TRADING_AMOUNT")
-    ranked_items = sorted(
-        (item for item in ranking.get("rankings", []) if isinstance(item, dict)),
-        key=lambda item: int(item["rank"]) if str(item.get("rank", "")).isdigit() else float("inf"),
-    )
-    ordered_symbols = [
-        str(item.get("symbol", "")).strip().upper()
-        for item in ranked_items
-        if isinstance(item, dict) and item.get("symbol")
-    ]
-    selected_symbols = list(dict.fromkeys(
-        symbol for symbol in ordered_symbols if symbol in candidates_by_symbol
-    ))
-    if request.cash_percentage is None:
-        selected_symbols = selected_symbols[:request.max_symbols]
-    if not selected_symbols:
-        raise EngineError(
-            "no_liquid_sector_candidates",
-            "섹터 후보가 현재 거래대금 상위 100종목에 없습니다. 섹터 키워드나 시장을 확인하세요.",
-            422,
+    if manual_selection:
+        selected_symbols = list(request.chosen_symbols)
+        if any(symbol not in candidates_by_symbol for symbol in selected_symbols):
+            raise EngineError("selection_not_in_sector", "선택한 종목이 현재 섹터 검색 결과에 없습니다. 다시 검색하세요.", 422)
+        ordered_symbols = selected_symbols
+    else:
+        ranking = await toss_client.get_market_rankings(request.market, "MARKET_TRADING_AMOUNT")
+        ranked_items = sorted(
+            (item for item in ranking.get("rankings", []) if isinstance(item, dict)),
+            key=lambda item: int(item["rank"]) if str(item.get("rank", "")).isdigit() else float("inf"),
         )
+        ordered_symbols = [
+            str(item.get("symbol", "")).strip().upper()
+            for item in ranked_items
+            if isinstance(item, dict) and item.get("symbol")
+        ]
+        selected_symbols = list(dict.fromkeys(
+            symbol for symbol in ordered_symbols if symbol in candidates_by_symbol
+        ))
+        if request.cash_percentage is None:
+            selected_symbols = selected_symbols[:request.max_symbols]
+        if not selected_symbols:
+            raise EngineError(
+                "no_liquid_sector_candidates",
+                "섹터 후보가 현재 거래대금 상위 100종목에 없습니다. 섹터 키워드나 시장을 확인하세요.",
+                422,
+            )
 
     quotes = await toss_client.get_prices(selected_symbols)
     ticks = {}
@@ -199,23 +207,48 @@ async def _apply_auto_discovery_scan(
                 raise EngineError("insufficient_investment_cash", "투자 가능한 가용현금이 없습니다.", 422)
         else:
             new_budget = allocation["available_for_investment"] if allocation else Decimal("0")
-        plan = await investment_planner.plan({
-            "keyword": request.keyword, "cash_percentage": request.cash_percentage,
-            "available_cash": account["available_cash"],
-            "new_investment_budget": new_budget,
-            "existing_total_limit": request.total_investment,
-            "existing_positions": await engine.positions_snapshot(),
-            "fee_rate": engine.fee_rate,
-            "candidates": [{
-                "symbol": symbol, "name": candidates_by_symbol[symbol]["name"],
-                "price": ticks[symbol].price, "trading_amount_order": ordered_symbols.index(symbol) + 1,
-                "relevance_score": candidates_by_symbol[symbol].get("relevance_score"),
-                "business_summary": candidates_by_symbol[symbol].get("business_summary"),
-            } for symbol in selected_symbols],
-        })
-        selected_symbols = [item.symbol for item in plan.items]
-        weights = {item.symbol: Decimal(item.weight_percent) for item in plan.items}
-        planner_reason, planner_model = plan.reason, investment_planner.model
+        if manual_selection:
+            if start:
+                ranking = await toss_client.get_market_rankings(request.market, "MARKET_TRADING_AMOUNT")
+                ranks = {
+                    str(item["symbol"]).strip().upper(): int(item["rank"])
+                    for item in ranking.get("rankings", [])
+                    if isinstance(item, dict) and item.get("symbol") and str(item.get("rank", "")).isdigit()
+                }
+                try:
+                    weights = liquidity_price_weights(
+                        {symbol: ticks[symbol].price for symbol in selected_symbols}, ranks, new_budget,
+                        fee_rate=engine.fee_rate, slippage_rate=engine.slippage_rate,
+                    )
+                except ValueError as exc:
+                    raise EngineError("invalid_auto_allocation", str(exc), 422) from exc
+            else:
+                saved = await engine.auto_discovery_snapshot()
+                try:
+                    weights = {
+                        symbol: Decimal(str(saved["allocation_weights"][symbol]))
+                        for symbol in selected_symbols
+                    }
+                except (KeyError, InvalidOperation) as exc:
+                    raise EngineError("invalid_saved_allocation", "저장된 종목별 배분을 확인할 수 없습니다.", 409) from exc
+        else:
+            plan = await investment_planner.plan({
+                "keyword": request.keyword, "cash_percentage": request.cash_percentage,
+                "available_cash": account["available_cash"],
+                "new_investment_budget": new_budget,
+                "existing_total_limit": request.total_investment,
+                "existing_positions": await engine.positions_snapshot(),
+                "fee_rate": engine.fee_rate,
+                "candidates": [{
+                    "symbol": symbol, "name": candidates_by_symbol[symbol]["name"],
+                    "price": ticks[symbol].price, "trading_amount_order": ordered_symbols.index(symbol) + 1,
+                    "relevance_score": candidates_by_symbol[symbol].get("relevance_score"),
+                    "business_summary": candidates_by_symbol[symbol].get("business_summary"),
+                } for symbol in selected_symbols],
+            })
+            selected_symbols = [item.symbol for item in plan.items]
+            weights = {item.symbol: Decimal(item.weight_percent) for item in plan.items}
+            planner_reason, planner_model = plan.reason, investment_planner.model
     for symbol in selected_symbols:
         await engine.update_tick(ticks[symbol])
     items = await engine.apply_auto_discovery_selection(
@@ -297,6 +330,8 @@ async def lifespan(_: FastAPI):
     engine.enable_persistence(STATE_PATH)
     await engine.configure_untraded_initial_cash(configured_initial_cash)
     await engine.enforce_fixed_auto_windows()
+    if await engine.reconcile_saved_sector_allocations():
+        logger.info("Reconciled duplicate PAPER sector budgets from a previous version")
     monitor_task = asyncio.create_task(_market_data_monitor()) if toss_client.configured else None
     try:
         yield
@@ -510,6 +545,17 @@ async def orders(
     order_status: Annotated[OrderStatus | None, Query(alias="status")] = None,
 ) -> dict[str, object]:
     return {"items": await engine.orders_snapshot(order_status)}
+
+
+@app.get("/api/v1/trade-history")
+async def trade_history(
+    trade_date: Annotated[date | None, Query(alias="date")] = None,
+    side: OrderSide | None = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, object]:
+    """Read durable PAPER fills, optionally by Korean calendar day and side."""
+    return await engine.trade_history_snapshot(trade_date, side, limit=limit, offset=offset)
 
 
 @app.post("/api/v1/market/ticks", status_code=status.HTTP_200_OK)

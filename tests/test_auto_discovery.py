@@ -269,6 +269,229 @@ class AutoDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(Decimal(status["cash_base"]), Decimal("10000"))
                 self.assertEqual(status["planner_model"], "gpt-test")
 
+    async def test_chosen_stocks_use_cash_ratio_and_rule_based_weights_without_ai(self):
+        unavailable_planner = SimpleNamespace(
+            status=AsyncMock(return_value={"configured": False, "message": "OpenAI 키가 없습니다."}),
+            plan=AsyncMock(),
+        )
+        with patch.object(dashboard, "investment_planner", unavailable_planner):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=dashboard.app), base_url="http://test") as client:
+                response = await client.post("/api/v1/auto-discovery/start", json={
+                    "keyword": "냉각", "market": "KR", "cash_percentage": 40,
+                    "chosen_symbols": ["066570", "083450"],
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"]["selected_symbols"], ["066570", "083450"])
+                self.assertEqual(response.json()["config"]["chosen_symbols"], ["066570", "083450"])
+                self.assertEqual(response.json()["config"]["total_investment"], "4000.00")
+                weights = response.json()["config"]["allocation_weights"]
+                self.assertEqual(sum(Decimal(value) for value in weights.values()), Decimal("100"))
+                self.assertGreater(Decimal(weights["066570"]), Decimal(weights["083450"]))
+                self.assertTrue(self.engine.trading_enabled)
+                self.assertEqual(len(self.engine.orders), 0)
+                self.client.get_market_rankings.assert_awaited_once()
+                unavailable_planner.status.assert_not_awaited()
+                unavailable_planner.plan.assert_not_awaited()
+
+                await dashboard._scan_auto_discovery()
+                status = (await client.get("/api/v1/auto-discovery")).json()
+                self.assertEqual(status["chosen_symbols"], ["066570", "083450"])
+                self.assertEqual(status["allocation_weights"], weights)
+                self.client.get_market_rankings.assert_awaited_once()
+                unavailable_planner.plan.assert_not_awaited()
+                restored = PaperEngine()
+                restore_engine(restored, dump_engine(self.engine))
+                self.assertEqual(restored.auto_discovery.chosen_symbols, ["066570", "083450"])
+                self.assertEqual(sum(restored.auto_discovery.allocation_weights.values()), Decimal("100"))
+
+    async def test_started_sectors_accumulate_and_survive_scan_and_restore(self):
+        first = AutoDiscoveryRequest(
+            keyword="우주", cash_percentage=40, chosen_symbols=["066570", "053080"]
+        )
+        second = AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["083450"]
+        )
+        await dashboard.start_auto_discovery(first)
+        first_budgets = {
+            item["symbol"]: item["budget"]
+            for item in (await self.engine.auto_allocation_snapshot())["items"]
+        }
+        await dashboard.start_auto_discovery(second)
+        snapshot = await dashboard.get_auto_discovery()
+        self.assertEqual(snapshot["selected_symbols"], ["066570", "053080", "083450"])
+        self.assertEqual([sector["keyword"] for sector in snapshot["active_sectors"]], ["우주", "냉각"])
+        self.assertEqual(Decimal(snapshot["total_investment"]), Decimal("8000"))
+        allocation = snapshot["allocation"]
+        self.assertEqual([item["symbol"] for item in allocation["items"]], snapshot["selected_symbols"])
+        self.assertEqual(
+            {item["symbol"]: item["budget"] for item in allocation["items"] if item["symbol"] in first_budgets},
+            first_budgets,
+        )
+        self.assertTrue(all(self.engine.strategies[self.engine.auto_strategy_ids[symbol]].entry_enabled
+                            for symbol in snapshot["selected_symbols"]))
+        await dashboard._scan_auto_discovery()
+        self.assertEqual((await dashboard.get_auto_discovery())["selected_symbols"], snapshot["selected_symbols"])
+        restored = PaperEngine()
+        restore_engine(restored, dump_engine(self.engine))
+        self.assertEqual(restored.auto_discovery.managed_symbols, snapshot["selected_symbols"])
+        self.assertEqual([sector.keyword for sector in restored.auto_discovery.active_sectors], ["우주", "냉각"])
+
+    async def test_new_sector_cannot_consume_cash_reserved_for_started_sectors(self):
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="우주", cash_percentage=40, chosen_symbols=["066570"]
+        ))
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["083450"]
+        ))
+        before = await self.engine.auto_discovery_snapshot()
+        with self.assertRaises(EngineError) as error:
+            await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+                keyword="추가", cash_percentage=40, chosen_symbols=["053080"]
+            ))
+        self.assertEqual(error.exception.code, "insufficient_unallocated_cash")
+        self.assertEqual(await self.engine.auto_discovery_snapshot(), before)
+
+    async def test_previous_saved_manual_sector_is_included_when_new_sector_starts(self):
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="우주", cash_percentage=40, chosen_symbols=["066570"]
+        ))
+        # A state saved by the previous version has no active_sectors field.
+        self.engine.auto_discovery.active_sectors = []
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["083450"]
+        ))
+        status = await dashboard.get_auto_discovery()
+        self.assertEqual([sector["keyword"] for sector in status["active_sectors"]], ["우주", "냉각"])
+        self.assertEqual(status["selected_symbols"], ["066570", "083450"])
+
+    async def test_repeated_start_with_same_sector_and_selection_does_not_double_budget(self):
+        request = AutoDiscoveryRequest(
+            keyword="우주", cash_percentage=40, chosen_symbols=["066570", "053080"]
+        )
+        await dashboard.start_auto_discovery(request)
+        before = await self.engine.auto_discovery_snapshot()
+        await dashboard.start_auto_discovery(request)
+        self.assertEqual(await self.engine.auto_discovery_snapshot(), before)
+        self.assertEqual(len(self.engine.auto_discovery.active_sectors), 1)
+
+    async def test_sector_percentage_is_one_shared_limit_for_two_stocks(self):
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["066570", "083450"]
+        ))
+        allocation = await self.engine.auto_allocation_snapshot()
+        self.assertEqual(allocation["total_investment"], Decimal("4000"))
+        self.assertEqual(sum((item["budget"] for item in allocation["items"]), Decimal("0")), Decimal("4000"))
+        self.assertEqual(len(self.engine.auto_discovery.active_sectors), 1)
+        self.assertEqual(self.engine.auto_discovery.active_sectors[0].investment_budget, Decimal("4000"))
+
+    async def test_same_sector_after_another_sector_does_not_double_its_limit(self):
+        cooling = AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["066570", "083450"]
+        )
+        await dashboard.start_auto_discovery(cooling)
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="우주", cash_percentage=10, chosen_symbols=["053080"]
+        ))
+        before = await self.engine.auto_discovery_snapshot()
+        await dashboard.start_auto_discovery(cooling.model_copy(update={
+            "chosen_symbols": ["083450", "066570"]
+        }))
+        self.assertEqual(await self.engine.auto_discovery_snapshot(), before)
+        self.assertEqual((await self.engine.auto_allocation_snapshot())["total_investment"], Decimal("5000"))
+
+    async def test_changing_same_sector_replaces_its_limit_and_keeps_other_sector(self):
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["066570", "083450"]
+        ))
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="우주", cash_percentage=10, chosen_symbols=["053080"]
+        ))
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=20, chosen_symbols=["066570", "083450"]
+        ))
+        allocation = await self.engine.auto_allocation_snapshot()
+        self.assertEqual(allocation["total_investment"], Decimal("3000"))
+        self.assertEqual(sum((item["budget"] for item in allocation["items"]), Decimal("0")), Decimal("3000"))
+        self.assertEqual([sector.cash_percentage for sector in self.engine.auto_discovery.active_sectors], [20, 10])
+        self.assertEqual([sector.keyword for sector in self.engine.auto_discovery.active_sectors], ["냉각", "우주"])
+
+    async def test_reselected_old_disabled_stock_does_not_reuse_stale_budget(self):
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["053080"]
+        ))
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["066570"]
+        ))
+        self.assertFalse(self.engine.strategies[self.engine.auto_strategy_ids["053080"]].enabled)
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="우주", cash_percentage=10, chosen_symbols=["053080"]
+        ))
+        budgets = {item["symbol"]: item["budget"] for item in (await self.engine.auto_allocation_snapshot())["items"]}
+        self.assertEqual(budgets["053080"], Decimal("1000"))
+        self.assertEqual(sum(budgets.values(), Decimal("0")), Decimal("5000"))
+
+    async def test_old_duplicate_sector_state_is_repaired_without_trades(self):
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="냉각", cash_percentage=40, chosen_symbols=["066570", "083450"]
+        ))
+        cooling = self.engine.auto_discovery.active_sectors[0]
+        await dashboard.start_auto_discovery(AutoDiscoveryRequest(
+            keyword="우주", cash_percentage=10, chosen_symbols=["053080"]
+        ))
+        self.engine.auto_discovery.active_sectors.insert(1, cooling.model_copy(update={
+            "symbols": list(reversed(cooling.symbols)), "symbol_budgets": {}
+        }))
+        self.engine.auto_discovery.active_sectors[0].symbol_budgets = {}
+        self.engine.auto_discovery.active_sectors[2].symbol_budgets = {}
+        self.engine.auto_discovery.total_investment = Decimal("9000")
+        for symbol in cooling.symbols:
+            self.engine.strategies[self.engine.auto_strategy_ids[symbol]].investment_budget *= 2
+        self.engine.strategies[self.engine.auto_strategy_ids["053080"]].investment_budget += Decimal("500")
+        saved = dump_engine(self.engine)
+        for sector in saved["auto_discovery"]["active_sectors"]:
+            sector.pop("symbol_budgets")  # snapshots from the previous version
+        restored = PaperEngine()
+        restore_engine(restored, saved)
+        self.assertTrue(await restored.reconcile_saved_sector_allocations())
+        allocation = await restored.auto_allocation_snapshot()
+        self.assertEqual(allocation["total_investment"], Decimal("5000"))
+        self.assertEqual(sum((item["budget"] for item in allocation["items"]), Decimal("0")), Decimal("5000"))
+        self.assertEqual([sector.keyword for sector in restored.auto_discovery.active_sectors], ["냉각", "우주"])
+        self.assertEqual(len(restored.auto_discovery.active_sectors), 2)
+
+    async def test_unaffordable_rule_based_selection_keeps_existing_setup(self):
+        await dashboard.start_auto_discovery(self.request)
+        before = dump_engine(self.engine)
+        self.client.get_prices.side_effect = lambda symbols: [
+            {"symbol": symbol, "lastPrice": "8000"} for symbol in symbols
+        ]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=dashboard.app), base_url="http://test") as client:
+            response = await client.post("/api/v1/auto-discovery/start", json={
+                "keyword": "냉각", "cash_percentage": 40,
+                "chosen_symbols": ["066570", "083450"],
+            })
+            self.assertEqual(response.status_code, 422)
+            self.assertEqual(response.json()["error"]["code"], "invalid_auto_allocation")
+        self.assertEqual(dump_engine(self.engine), before)
+
+    async def test_chosen_stocks_reject_invalid_or_unsearched_symbols_without_starting(self):
+        await self.engine.pause()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=dashboard.app), base_url="http://test") as client:
+            for symbols in ([], ["066570", "066570"], ["066570", 123]):
+                with self.subTest(symbols=symbols):
+                    result = await client.post("/api/v1/auto-discovery/start", json={
+                        "keyword": "냉각", "cash_percentage": 40, "chosen_symbols": symbols,
+                    })
+                    self.assertEqual(result.status_code, 422)
+            unsearched = await client.post("/api/v1/auto-discovery/start", json={
+                "keyword": "냉각", "cash_percentage": 40, "chosen_symbols": ["NOT_IN_SECTOR"],
+            })
+            self.assertEqual(unsearched.status_code, 422)
+            self.assertEqual(unsearched.json()["error"]["code"], "selection_not_in_sector")
+        self.assertFalse(self.engine.trading_enabled)
+        self.assertFalse(self.engine.auto_discovery.enabled)
+        self.assertEqual(len(self.engine.orders), 0)
+
     async def test_missing_ai_key_or_interrupted_ai_plan_cannot_replace_selection(self):
         await dashboard.start_auto_discovery(self.request)
         before = dump_engine(self.engine)

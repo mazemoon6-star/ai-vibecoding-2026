@@ -13,7 +13,7 @@ import json
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_FLOOR
 from typing import Any
 from uuid import uuid4
@@ -23,6 +23,7 @@ from .paper_state import PaperStateStore, StateStoreError, dump_engine, restore_
 from .models import (
     AUTO_STRATEGY_LONG_WINDOW,
     AUTO_STRATEGY_SHORT_WINDOW,
+    ActiveSector,
     AutoDiscoveryConfig,
     AutoDiscoveryRequest,
     AutoStrategySettings,
@@ -169,6 +170,7 @@ class PaperEngine:
                 store.save(dump_engine(self))
             else:
                 restore_engine(self, snapshot)
+                store.backfill_trade_history(snapshot)
             self.state_store = store
         except BaseException:
             store.close()
@@ -815,12 +817,14 @@ class PaperEngine:
                 tick = self.ticks.get(symbol)
                 items.append({
                     "symbol": symbol, "name": tick.name if tick else instrument_name(symbol),
+                    "sectors": [sector.keyword for sector in self.auto_discovery.active_sectors
+                                if symbol in sector.symbols],
                     "budget": strategy.investment_budget,
                     "committed": self._committed_investment_unlocked({symbol}),
                     "estimated_quantity": plan["quantity"], "estimated_price": plan["price"],
                     "estimated_fee": plan["fee"], "estimated_total": plan["estimated_total"],
                     "remaining": plan["remaining"],
-                    "weight_percent": self.auto_discovery.allocation_weights.get(symbol),
+                    "weight_percent": (strategy.investment_budget * 100 / total) if total > 0 else None,
                 })
             return {
                 "currency": "KRW", "total_investment": total, "committed": committed,
@@ -830,6 +834,109 @@ class PaperEngine:
                 "cash_percentage": self.auto_discovery.cash_percentage,
                 "cash_base": self.auto_discovery.cash_base,
             }
+
+    @staticmethod
+    def _split_sector_budget(
+        symbols: list[str], budget: Decimal, weights: dict[str, Decimal]
+    ) -> dict[str, Decimal]:
+        """Allocate one sector limit across its stocks without creating money."""
+        portions: dict[str, Decimal] = {}
+        remaining = budget
+        for symbol in symbols[:-1]:
+            portion = (budget * weights[symbol] / 100).quantize(
+                Decimal("0.00000001"), rounding=ROUND_DOWN
+            )
+            portions[symbol] = portion
+            remaining -= portion
+        portions[symbols[-1]] = remaining
+        return portions
+
+    def _normalized_active_sectors_unlocked(self) -> list[ActiveSector]:
+        """Upgrade saved sectors and keep the latest entry for each sector."""
+        sectors = list(self.auto_discovery.active_sectors)
+        if not sectors and self.auto_discovery.keyword and self.auto_discovery.managed_symbols:
+            active = [symbol for symbol in self.auto_discovery.managed_symbols if (
+                strategy := self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+            ) is not None and strategy.entry_enabled]
+            if active:
+                sectors = [ActiveSector(
+                    keyword=self.auto_discovery.keyword, market=self.auto_discovery.market,
+                    symbols=active, cash_percentage=self.auto_discovery.cash_percentage,
+                    investment_budget=self.auto_discovery.total_investment or Decimal("0"),
+                )]
+        latest = {(sector.market, sector.keyword.casefold()): index
+                  for index, sector in enumerate(sectors)}
+        normalized = []
+        for index, sector in enumerate(sectors):
+            if latest[(sector.market, sector.keyword.casefold())] != index:
+                continue
+            symbols = list(dict.fromkeys(sector.symbols))
+            if not symbols:
+                continue
+            saved = sector.symbol_budgets
+            if (set(saved) == set(symbols)
+                    and all(amount.is_finite() and amount >= 0 for amount in saved.values())
+                    and sum(saved.values(), Decimal("0")) == sector.investment_budget):
+                normalized.append(sector)
+                continue
+            # Older snapshots only stored the sector total. Preserve the old
+            # relative stock allocation where possible; never reuse the old
+            # absolute strategy budget, which may include another sector.
+            old_amounts = {
+                symbol: max(Decimal("0"), (
+                    strategy.investment_budget if (
+                        strategy := self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+                    ) is not None and strategy.investment_budget is not None else Decimal("0")
+                )) for symbol in symbols
+            }
+            weight_total = sum(old_amounts.values(), Decimal("0"))
+            weights = {
+                symbol: (old_amounts[symbol] * 100 / weight_total if weight_total > 0
+                         else Decimal("100") / len(symbols))
+                for symbol in symbols
+            }
+            normalized.append(sector.model_copy(update={
+                "symbols": symbols,
+                "symbol_budgets": self._split_sector_budget(symbols, sector.investment_budget, weights),
+            }))
+        return normalized
+
+    async def reconcile_saved_sector_allocations(self) -> bool:
+        """Repair pre-fix duplicate sectors only when no trade can be affected."""
+        async with self._mutation():
+            if not self.auto_discovery.active_sectors or self.orders or any(
+                position.quantity > 0 for position in self.positions.values()
+            ):
+                return False
+            sectors = self._normalized_active_sectors_unlocked()
+            budgets: dict[str, Decimal] = {}
+            for sector in sectors:
+                for symbol, amount in sector.symbol_budgets.items():
+                    budgets[symbol] = budgets.get(symbol, Decimal("0")) + amount
+            total = sum((sector.investment_budget for sector in sectors), Decimal("0"))
+            if (sectors == self.auto_discovery.active_sectors
+                    and total == self.auto_discovery.total_investment
+                    and all((strategy := self.strategies.get(self.auto_strategy_ids.get(symbol, "")))
+                            is not None and strategy.investment_budget == amount
+                            for symbol, amount in budgets.items())):
+                return False
+            for symbol in self.auto_discovery.managed_symbols:
+                if symbol not in budgets:
+                    strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+                    if strategy is not None:
+                        strategy.enabled = False
+                    self.auto_watchlist.pop(symbol, None)
+                    self.auto_strategy_settings.pop(symbol, None)
+            for symbol, amount in budgets.items():
+                strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+                if strategy is not None:
+                    strategy.investment_budget = amount
+                    strategy.max_position = None
+            self.auto_discovery.active_sectors = sectors
+            self.auto_discovery.managed_symbols = list(budgets)
+            self.auto_discovery.total_investment = total
+            self.auto_discovery.revision += 1
+            return True
 
     async def apply_auto_discovery_selection(
         self,
@@ -854,6 +961,110 @@ class PaperEngine:
             if any(symbol not in self.ticks for symbol in selected):
                 raise EngineError("price_unavailable", "선정 종목의 현재가를 확보하지 못했습니다.", 409)
 
+            # Manual cash-ratio starts are additive: a new sector must not retire
+            # strategies already started for another sector. Periodic scans only
+            # refresh prices for the latest fixed manual selection.
+            if request.cash_percentage is not None and request.chosen_symbols is not None:
+                if not start:
+                    return [self._auto_watchlist_dict(symbol) for symbol in self.auto_discovery.managed_symbols]
+                weights = allocation_weights or {}
+                if (set(weights) != set(selected)
+                        or any(not weight.is_finite() or weight <= 0 for weight in weights.values())
+                        or sum(weights.values(), Decimal("0")) != 100):
+                    raise EngineError("invalid_allocation_weights", "종목별 투자 비중이 올바르지 않습니다.", 422)
+                previous = self.auto_discovery
+                previous_symbols = list(previous.managed_symbols)
+                if any(
+                    (strategy := self.strategies.get(self.auto_strategy_ids.get(symbol, ""))) is not None
+                    and strategy.entry_enabled and strategy.investment_budget is None
+                    for symbol in previous_symbols
+                ):
+                    raise EngineError("incompatible_auto_budget", "기존 수량 기반 자동매매를 정지한 뒤 비율 투자를 시작하세요.", 409)
+                if any(
+                    (self.ticks[symbol].currency or instrument_currency(symbol)) != "KRW"
+                    for symbol in selected
+                ):
+                    raise EngineError("budget_currency_mismatch", "원화 배분 대상에는 원화 종목만 포함할 수 있습니다.", 422)
+                sectors = self._normalized_active_sectors_unlocked()
+                if (previous.active_sectors and sectors != previous.active_sectors
+                        and (self.orders or any(position.quantity > 0 for position in self.positions.values()))):
+                    raise EngineError(
+                        "legacy_sector_review_required",
+                        "기존 섹터 한도에 거래 내역이 있어 자동 정리가 어렵습니다. 저장된 설정을 확인하세요.", 409,
+                    )
+                sector_key = (request.market, request.keyword.casefold())
+                existing_index = next((index for index, sector in enumerate(sectors)
+                                       if (sector.market, sector.keyword.casefold()) == sector_key), None)
+                existing = sectors[existing_index] if existing_index is not None else None
+                if (existing is not None and existing.cash_percentage == request.cash_percentage
+                        and set(existing.symbols) == set(selected)):
+                    # Repeating a sector, including after starting another sector,
+                    # never allocates the same cash again.
+                    return [self._auto_watchlist_dict(symbol) for symbol in previous.managed_symbols]
+                if existing is not None and self._committed_investment_unlocked(set(existing.symbols)) > 0:
+                    raise EngineError(
+                        "sector_has_committed_orders",
+                        "보유·대기 주문이 있는 섹터의 투자 한도는 자동으로 변경할 수 없습니다.", 409,
+                    )
+                other_sectors = [sector for index, sector in enumerate(sectors) if index != existing_index]
+                other_total = sum((sector.investment_budget for sector in other_sectors), Decimal("0"))
+                other_symbols = {symbol for sector in other_sectors for symbol in sector.symbols}
+                other_reserved = max(Decimal("0"), other_total - self._committed_investment_unlocked(other_symbols))
+                cash_base = self.available_cash
+                sector_budget = (cash_base * request.cash_percentage / 100).quantize(
+                    Decimal("0.01"), rounding=ROUND_DOWN
+                )
+                if sector_budget <= 0 or sector_budget > max(Decimal("0"), cash_base - other_reserved):
+                    raise EngineError(
+                        "insufficient_unallocated_cash",
+                        "기존 자동매매 투자 한도를 제외하면 선택한 비율만큼의 현금이 부족합니다. 투자 비율을 낮추세요.",
+                        422,
+                    )
+                new_sector = ActiveSector(
+                    keyword=request.keyword, market=request.market, symbols=selected,
+                    cash_percentage=request.cash_percentage, investment_budget=sector_budget,
+                    symbol_budgets=self._split_sector_budget(selected, sector_budget, weights),
+                )
+                if existing_index is None:
+                    sectors.append(new_sector)
+                else:
+                    sectors[existing_index] = new_sector
+                budgets: dict[str, Decimal] = {}
+                for sector in sectors:
+                    for symbol, amount in sector.symbol_budgets.items():
+                        budgets[symbol] = budgets.get(symbol, Decimal("0")) + amount
+                for symbol in previous_symbols:
+                    if symbol in budgets:
+                        continue
+                    if self._committed_investment_unlocked({symbol}) > 0:
+                        raise EngineError("sector_has_committed_orders", "보유·대기 주문이 있는 종목은 제외할 수 없습니다.", 409)
+                    strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+                    if strategy is not None:
+                        strategy.enabled = False
+                    self.auto_watchlist.pop(symbol, None)
+                    self.auto_strategy_settings.pop(symbol, None)
+                for symbol, amount in budgets.items():
+                    self.auto_watchlist.setdefault(symbol, utc_now())
+                    strategy = self.strategies.get(self.auto_strategy_ids.get(symbol, ""))
+                    if symbol in selected or strategy is None:
+                        self._activate_auto_strategy_unlocked(
+                            symbol, AutoStrategySettings(order_quantity=request.order_quantity)
+                        )
+                        strategy = self.strategies[self.auto_strategy_ids[symbol]]
+                    strategy.investment_budget = amount
+                    strategy.max_position = None
+                total = sum((sector.investment_budget for sector in sectors), Decimal("0"))
+                effective_request = request.model_copy(update={"total_investment": total})
+                self.auto_discovery = AutoDiscoveryConfig(
+                    **effective_request.model_dump(), enabled=True, revision=expected_revision + 1,
+                    managed_symbols=list(budgets),
+                    active_sectors=sectors, cash_base=cash_base,
+                    allocation_weights=weights, planner_reason=planner_reason, planner_model=planner_model,
+                )
+                self.kill_switch = False
+                self.trading_enabled = True
+                return [self._auto_watchlist_dict(symbol) for symbol in self.auto_discovery.managed_symbols]
+
             per_symbol_budget = None
             budgets: dict[str, Decimal] = {}
             cash_base = self.auto_discovery.cash_base if not start else None
@@ -862,7 +1073,7 @@ class PaperEngine:
                 weights = allocation_weights or {}
                 if (set(weights) != set(selected) or any(not value.is_finite() or value <= 0 for value in weights.values())
                         or sum(weights.values(), Decimal("0")) != 100):
-                    raise EngineError("invalid_allocation_weights", "AI 종목별 투자 비중이 올바르지 않습니다.", 422)
+                    raise EngineError("invalid_allocation_weights", "종목별 투자 비중이 올바르지 않습니다.", 422)
                 managed = set(self.auto_discovery.managed_symbols) | set(selected)
                 committed = self._committed_investment_unlocked(managed)
                 if start:
@@ -1000,6 +1211,18 @@ class PaperEngine:
             if status is not None:
                 orders = (order for order in orders if order.status is status)
             return [self._order_dict(order) for order in orders]
+
+    async def trade_history_snapshot(
+        self, trade_date: date | None = None, side: OrderSide | None = None,
+        *, limit: int = 100, offset: int = 0,
+    ) -> dict[str, Any]:
+        async with self.lock:
+            if self.state_store is None:
+                raise EngineError("history_storage_unavailable", "PAPER 거래 히스토리 DB를 사용할 수 없습니다.", 503)
+            try:
+                return self.state_store.trade_history(trade_date, side, limit=limit, offset=offset)
+            except StateStoreError as exc:
+                raise EngineError("history_storage_error", "PAPER 거래 히스토리를 읽을 수 없습니다.", 503) from exc
 
     async def metrics_snapshot(self) -> dict[str, Any]:
         async with self.lock:

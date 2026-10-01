@@ -8,13 +8,17 @@ import os
 import sqlite3
 from collections import defaultdict, deque
 from dataclasses import asdict, fields
-from datetime import datetime
-from decimal import Decimal
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import get_args, get_type_hints
 
+from .instruments import instrument_name
 from .models import AutoDiscoveryConfig, AutoStrategySettings, OrderSide, OrderStatus, utc_now
+
+
+KST = timezone(timedelta(hours=9))
 
 
 class StateStoreError(RuntimeError):
@@ -59,7 +63,25 @@ class PaperStateStore:
             self.connection.execute("PRAGMA journal_mode=WAL")
             self.connection.execute("PRAGMA synchronous=FULL")
             self.connection.execute("CREATE TABLE IF NOT EXISTS paper_state (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, payload TEXT NOT NULL, checksum TEXT NOT NULL, saved_at TEXT NOT NULL)")
+            self.connection.execute("""CREATE TABLE IF NOT EXISTS trade_history (
+                order_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                name TEXT NOT NULL,
+                side TEXT NOT NULL CHECK(side IN ('BUY', 'SELL')),
+                quantity TEXT NOT NULL,
+                average_filled_price TEXT NOT NULL,
+                fee TEXT NOT NULL,
+                gross_amount TEXT NOT NULL,
+                filled_at TEXT NOT NULL,
+                trade_date_kst TEXT NOT NULL,
+                strategy_id TEXT,
+                client_order_id TEXT NOT NULL
+            )""")
+            self.connection.execute("CREATE INDEX IF NOT EXISTS trade_history_by_date ON trade_history (trade_date_kst, side, filled_at)")
             self.connection.commit()
+            self._recorded_order_ids = {
+                row[0] for row in self.connection.execute("SELECT order_id FROM trade_history")
+            }
         except (OSError, sqlite3.Error) as exc:
             self.close()
             raise StateStoreError("Cannot open PAPER state storage (or another server owns it).") from exc
@@ -82,13 +104,94 @@ class PaperStateStore:
         try:
             payload = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=json_value, allow_nan=False)
             checksum = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            rows = self._new_trade_rows(state)
             with self.connection:
                 self.connection.execute(
                     "INSERT INTO paper_state VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET version=excluded.version, payload=excluded.payload, checksum=excluded.checksum, saved_at=excluded.saved_at",
                     (self.VERSION, payload, checksum, utc_now().isoformat()),
                 )
-        except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+                self._insert_trade_rows(rows)
+            self._recorded_order_ids.update(row[0] for row in rows)
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, InvalidOperation) as exc:
             raise StateStoreError("Could not commit PAPER state.") from exc
+
+    def backfill_trade_history(self, state) -> None:
+        """Import filled orders from older one-row snapshots exactly once."""
+        try:
+            rows = self._new_trade_rows(state)
+            if rows:
+                with self.connection:
+                    self._insert_trade_rows(rows)
+                self._recorded_order_ids.update(row[0] for row in rows)
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, InvalidOperation) as exc:
+            raise StateStoreError("Could not backfill PAPER trade history.") from exc
+
+    def _new_trade_rows(self, state) -> list[tuple]:
+        rows = []
+        for order in state["orders"].values():
+            if order["status"] != OrderStatus.FILLED or order["order_id"] in self._recorded_order_ids:
+                continue
+            filled_at = datetime.fromisoformat(order["filled_at"])
+            if filled_at.tzinfo is None:
+                raise ValueError("A filled order must have a timezone-aware fill time")
+            filled_at = filled_at.astimezone(timezone.utc)
+            quantity = Decimal(str(order["filled_quantity"]))
+            price = Decimal(str(order["average_filled_price"]))
+            fee = Decimal(str(order["fee"]))
+            if not all(value.is_finite() for value in (quantity, price, fee)) or quantity <= 0 or price <= 0 or fee < 0:
+                raise ValueError("Invalid filled order in PAPER state")
+            symbol = order["symbol"]
+            name = state.get("ticks", {}).get(symbol, {}).get("name") or instrument_name(symbol)
+            rows.append((
+                order["order_id"], symbol, name, str(order["side"]), str(quantity), str(price), str(fee),
+                str((quantity * price).quantize(Decimal("0.00000001"))), filled_at.isoformat(),
+                filled_at.astimezone(KST).date().isoformat(), order.get("strategy_id"),
+                order["client_order_id"],
+            ))
+        return rows
+
+    def _insert_trade_rows(self, rows: list[tuple]) -> None:
+        self.connection.executemany(
+            """INSERT OR IGNORE INTO trade_history
+            (order_id, symbol, name, side, quantity, average_filled_price, fee,
+             gross_amount, filled_at, trade_date_kst, strategy_id, client_order_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+    def trade_history(
+        self, trade_date: date | None = None, side: OrderSide | None = None,
+        *, limit: int = 100, offset: int = 0,
+    ) -> dict:
+        clauses = []
+        values: list[object] = []
+        if trade_date is not None:
+            clauses.append("trade_date_kst = ?")
+            values.append(trade_date.isoformat())
+        if side is not None:
+            clauses.append("side = ?")
+            values.append(side.value)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        columns = (
+            "order_id", "symbol", "name", "side", "quantity", "average_filled_price", "fee",
+            "gross_amount", "filled_at", "trade_date_kst", "strategy_id", "client_order_id",
+        )
+        try:
+            total = self.connection.execute("SELECT COUNT(*) FROM trade_history" + where, values).fetchone()[0]
+            rows = self.connection.execute(
+                "SELECT " + ", ".join(columns) + " FROM trade_history" + where
+                + " ORDER BY filled_at DESC, order_id DESC LIMIT ? OFFSET ?",
+                [*values, limit, offset],
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise StateStoreError("Could not read PAPER trade history.") from exc
+        return {
+            "items": [dict(zip(columns, row)) for row in rows], "total": total,
+            "date": trade_date.isoformat() if trade_date is not None else None,
+            "side": side.value if side is not None else None,
+            "limit": limit, "offset": offset, "timezone": "Asia/Seoul",
+            "paper_only": True,
+        }
 
     def close(self):
         if self.connection is not None:

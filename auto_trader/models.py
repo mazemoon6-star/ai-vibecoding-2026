@@ -165,11 +165,31 @@ class AutoDiscoveryRequest(BaseModel):
     order_quantity: Decimal = Field(default=Decimal("1"), gt=0)
     total_investment: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=2)
     cash_percentage: int | None = Field(default=None, ge=10, le=100, multiple_of=10)
+    chosen_symbols: list[str] | None = None
+
+    @field_validator("chosen_symbols", mode="before")
+    @classmethod
+    def validate_chosen_symbols(cls, values: Any) -> list[str] | None:
+        if values is None:
+            return None
+        if not isinstance(values, list) or not 1 <= len(values) <= 5:
+            raise ValueError("검색 결과에서 1~5개 종목을 선택하세요.")
+        symbols: list[str] = []
+        for symbol in values:
+            if not isinstance(symbol, str) or not symbol.strip():
+                raise ValueError("종목코드가 올바르지 않습니다.")
+            normalized = symbol.strip().upper()
+            if normalized in symbols:
+                raise ValueError("중복된 종목을 선택할 수 없습니다.")
+            symbols.append(normalized)
+        return symbols
 
     @model_validator(mode="after")
     def validate_budget_market(self) -> "AutoDiscoveryRequest":
         if (self.total_investment is not None or self.cash_percentage is not None) and self.market != "KR":
             raise ValueError("금액 기준 분산투자는 국내 주식(KR)에서 지원합니다.")
+        if self.chosen_symbols is not None and self.cash_percentage is None:
+            raise ValueError("선택 종목 자동 배분에는 가용현금 투자 비율이 필요합니다.")
         return self
 
     @field_validator("keyword")
@@ -181,6 +201,17 @@ class AutoDiscoveryRequest(BaseModel):
         return value
 
 
+class ActiveSector(BaseModel):
+    """A started sector whose PAPER strategies remain active until automation stops."""
+
+    keyword: str
+    market: Literal["KR", "US"] = "KR"
+    symbols: list[str] = Field(default_factory=list)
+    cash_percentage: int | None = None
+    investment_budget: Decimal = Decimal("0")
+    symbol_budgets: dict[str, Decimal] = Field(default_factory=dict)
+
+
 class AutoDiscoveryConfig(AutoDiscoveryRequest):
     """Persisted discovery settings and the symbols managed by the scanner."""
 
@@ -188,6 +219,7 @@ class AutoDiscoveryConfig(AutoDiscoveryRequest):
     enabled: bool = False
     revision: int = Field(default=0, ge=0)
     managed_symbols: list[str] = Field(default_factory=list)
+    active_sectors: list[ActiveSector] = Field(default_factory=list)
     cash_base: Decimal | None = Field(default=None, ge=0)
     allocation_weights: dict[str, Decimal] = Field(default_factory=dict)
     planner_reason: str = ""

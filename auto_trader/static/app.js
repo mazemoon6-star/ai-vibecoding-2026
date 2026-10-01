@@ -6,7 +6,11 @@ let autoDiscoveryDraftRevision = 0;
 let autoDiscoveryBusy = false;
 let autoDiscoverySearchBusy = false;
 let latestAvailableCash = null;
-let investmentPlannerReady = false;
+let marketDataReady = false;
+let discoveryScanning = false;
+let searchedSector = null;
+let searchCandidates = [];
+const chosenSymbols = new Set();
 const investmentChart = new InvestmentChart($("#investment-card"));
 
 function esc(value) {
@@ -68,16 +72,29 @@ function show(message, isError = false, source = "action") {
   if (!isError) noticeTimer = setTimeout(() => { notice.hidden = true; }, 5000);
 }
 
+function updateManualStartState() {
+  const matchesSearch = searchedSector?.keyword === $("#auto-discovery-keyword").value.trim()
+    && searchedSector?.market === $("#auto-discovery-market").value;
+  const count = chosenSymbols.size;
+  const cashPercent = Number($("#auto-discovery-percentage").value);
+  if (searchedSector) {
+    $("#auto-discovery-selection-summary").textContent = count
+      ? `선택 ${count}개 종목 · 가용현금의 ${cashPercent}% 안에서 자동 배분${matchesSearch ? "" : " · 검색 조건이 바뀌어 다시 검색해야 합니다."}`
+      : "자동매매할 종목을 하나 이상 선택하세요.";
+  }
+  $("#auto-discovery-start").disabled = autoDiscoveryBusy || autoDiscoverySearchBusy || discoveryScanning
+    || !marketDataReady || !matchesSearch || $("#auto-discovery-market").value !== "KR"
+    || !count || !Number.isInteger(cashPercent) || cashPercent < 10 || cashPercent > 100 || cashPercent % 10 !== 0;
+}
+
 function renderAutoDiscovery(discovery, items, configured) {
   if (!autoDiscoveryDraft && !autoDiscoveryBusy) {
     if (discovery.keyword) $("#auto-discovery-keyword").value = discovery.keyword;
     $("#auto-discovery-market").value = discovery.market;
     $("#auto-discovery-percentage").value = String(discovery.cash_percentage || 10);
   }
-  investmentPlannerReady = Boolean(discovery.planner?.configured);
-  $("#auto-discovery-planner-status").textContent = investmentPlannerReady
-    ? "AI 자동 배분 사용 가능 · OpenAI · " + discovery.planner.model
-    : (discovery.planner?.message || "OpenAI 설정을 확인하세요.") + " 섹터 검색은 사용할 수 있습니다.";
+  marketDataReady = Boolean(configured);
+  discoveryScanning = Boolean(discovery.scanning);
   updateInvestmentPreview();
   const state = $("#auto-discovery-state");
   const running = discovery.enabled && discovery.trading_enabled;
@@ -90,8 +107,14 @@ function renderAutoDiscovery(discovery, items, configured) {
   const retiring = (discovery.retiring_symbols || []).map((symbol) => names.get(symbol) || symbol);
   const parts = [];
   if (!configured) parts.push("토스 시세 연동을 설정하고 서버를 다시 시작하면 자동 발굴을 사용할 수 있습니다.");
-  if (discovery.keyword) parts.push("적용 섹터: " + discovery.keyword + (discovery.market === "US" ? " (미국 주식)" : " (국내 주식)"));
-  if (discovery.cash_percentage != null) parts.push("적용 투자 비율: " + discovery.cash_percentage + "%");
+  if (discovery.active_sectors?.length) {
+    parts.push("운영 섹터: " + discovery.active_sectors.map((sector) =>
+      sector.keyword + " (" + sector.symbols.length + "종목, " + sector.cash_percentage + "% 적용)"
+    ).join(" / "));
+  } else {
+    if (discovery.keyword) parts.push("적용 섹터: " + discovery.keyword + (discovery.market === "US" ? " (미국 주식)" : " (국내 주식)"));
+    if (discovery.cash_percentage != null) parts.push("적용 투자 비율: " + discovery.cash_percentage + "%");
+  }
   if (discovery.planner_reason) parts.push("AI 배분 근거: " + discovery.planner_reason);
   if (selected.length) parts.push("선정 종목: " + selected.join(", "));
   if (retiring.length) parts.push("신규 매수 중단·매도 신호 감시: " + retiring.join(", "));
@@ -101,9 +124,9 @@ function renderAutoDiscovery(discovery, items, configured) {
   $("#auto-discovery-summary").textContent = parts.join(" · ")
     || "시작 후 자동 선정된 종목의 시세를 수집하고, 이평선 교차 신호가 발생하면 PAPER 주문을 실행합니다.";
   $("#auto-discovery-summary").classList.toggle("error", Boolean(discovery.error));
-  $("#auto-discovery-start").disabled = autoDiscoveryBusy || discovery.scanning || !configured || !investmentPlannerReady;
+  updateManualStartState();
   $("#auto-discovery-stop").disabled = !autoDiscoveryBusy && !discovery.scanning && !discovery.enabled;
-  renderAllocation(discovery.allocation);
+  renderAllocation(discovery.allocation, discovery.active_sectors || []);
 }
 
 function updateInvestmentPreview() {
@@ -114,7 +137,7 @@ function updateInvestmentPreview() {
     + " × " + percentage + "% = 신규 투자 예상 한도 " + currencyMoney(amount) + " · 실제 한도는 시작 시 확정";
 }
 
-function renderAllocation(allocation) {
+function renderAllocation(allocation, sectors = []) {
   $("#allocation-preview").hidden = !allocation;
   if (!allocation) return;
   const parts = [
@@ -122,8 +145,14 @@ function renderAllocation(allocation) {
     "기존 보유·매수 예약 " + currencyMoney(allocation.committed),
     "추가 투자 가능 " + currencyMoney(allocation.available_for_investment)
   ];
-  if (allocation.cash_percentage != null) {
+  if (allocation.cash_percentage != null && !allocation.items.some((item) => item.sectors?.length)) {
     parts.unshift("시작 시 가용현금 " + currencyMoney(allocation.cash_base) + " · 투자 비율 " + allocation.cash_percentage + "%");
+  }
+  if (sectors.length) {
+    parts.push("섹터별 한도: " + sectors.map((sector) =>
+      sector.keyword + " " + sector.cash_percentage + "% = " + currencyMoney(sector.investment_budget)
+      + " (" + sector.symbols.length + "종목)"
+    ).join(" / "));
   }
   if (Number(allocation.retiring_committed) > 0) {
     parts.push("선정 제외 보유분 " + currencyMoney(allocation.retiring_committed) + "은 배분에서 차감");
@@ -131,8 +160,8 @@ function renderAllocation(allocation) {
   $("#allocation-summary").textContent = parts.join(" · ");
   $("#allocation-body").innerHTML = allocation.items.map((item) =>
     '<tr><td><strong>' + esc(item.name) + '</strong><small class="volume-symbol">' + esc(item.symbol)
-    + '</small></td><td>' + (item.weight_percent == null ? "균등 배분" : money(item.weight_percent, 0) + "%")
-    + '</td><td>' + currencyMoney(item.budget) + '</td><td>'
+    + (item.sectors?.length ? ' · ' + esc(item.sectors.join(', ')) : '')
+    + '</small></td><td>' + currencyMoney(item.budget) + '</td><td>'
     + money(item.estimated_quantity, 0) + '주</td><td>' + currencyMoney(item.estimated_total) + '</td></tr>'
   ).join("");
 }
@@ -180,6 +209,7 @@ async function refresh() {
 function markAutoDiscoveryDraft() {
   autoDiscoveryDraft = true;
   autoDiscoveryDraftRevision += 1;
+  updateManualStartState();
 }
 $("#auto-discovery-form").addEventListener("input", markAutoDiscoveryDraft);
 $("#auto-discovery-form").addEventListener("change", markAutoDiscoveryDraft);
@@ -188,7 +218,17 @@ document.querySelectorAll("[data-sector-keyword]").forEach((button) => button.ad
   markAutoDiscoveryDraft();
   $("#auto-discovery-form").requestSubmit($("#auto-discovery-search"));
 }));
-$("#auto-discovery-percentage").addEventListener("change", updateInvestmentPreview);
+$("#auto-discovery-percentage").addEventListener("change", () => {
+  updateInvestmentPreview();
+  updateManualStartState();
+});
+$("#auto-discovery-search-results").addEventListener("change", (event) => {
+  const symbol = event.target?.dataset?.selectionSymbol;
+  if (!symbol || !searchCandidates.some((item) => item.symbol === symbol)) return;
+  if (event.target.checked) chosenSymbols.add(symbol);
+  else chosenSymbols.delete(symbol);
+  updateManualStartState();
+});
 $("#auto-discovery-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (autoDiscoverySearchBusy) return;
@@ -201,23 +241,33 @@ $("#auto-discovery-form").addEventListener("submit", async (event) => {
   const button = $("#auto-discovery-search");
   const resultBody = $("#auto-discovery-search-results");
   autoDiscoverySearchBusy = true;
+  searchedSector = null;
+  searchCandidates = [];
+  chosenSymbols.clear();
+  updateManualStartState();
   button.disabled = true;
   $("#auto-discovery-search-preview").hidden = false;
   $("#auto-discovery-search-summary").textContent = keyword + " · 검색 중";
-  resultBody.innerHTML = '<tr><td colspan="3" class="empty">관련 종목을 검색하고 있습니다.</td></tr>';
+  $("#auto-discovery-selection-summary").textContent = "검색 후 자동매매할 종목을 선택하세요.";
+  resultBody.innerHTML = '<tr><td colspan="4" class="empty">관련 종목을 검색하고 있습니다.</td></tr>';
   try {
     const result = await api(`/api/v1/market/related-stocks?keyword=${encodeURIComponent(keyword)}&market=${encodeURIComponent(market)}`);
-    resultBody.innerHTML = result.items.length
-      ? result.items.map((item) => '<tr><td><strong>' + esc(item.name) + '</strong></td><td>'
-        + esc(item.symbol) + '</td><td>' + currencyMoney(item.price, market === "US" ? "USD" : "KRW") + '</td></tr>').join("")
-      : '<tr><td colspan="3" class="empty">관련 종목을 찾을 수 없습니다.</td></tr>';
-    $("#auto-discovery-search-summary").textContent = `검색 섹터: ${keyword} (${market === "US" ? "미국 주식" : "국내 주식"}) · ${result.items.length}개 후보 · 검색만 완료`;
+    searchCandidates = result.items || [];
+    searchedSector = { keyword, market };
+    resultBody.innerHTML = searchCandidates.length
+      ? searchCandidates.map((item) => '<tr><td><strong>' + esc(item.name) + '</strong></td><td>'
+        + esc(item.symbol) + '</td><td>' + currencyMoney(item.price, market === "US" ? "USD" : "KRW")
+        + '</td><td><input class="sector-select-input" type="checkbox"'
+        + ' data-selection-symbol="' + esc(item.symbol) + '" aria-label="' + esc(item.name) + ' 자동매매 종목 선택" /></td></tr>').join("")
+      : '<tr><td colspan="4" class="empty">관련 종목을 찾을 수 없습니다.</td></tr>';
+    $("#auto-discovery-search-summary").textContent = `검색 섹터: ${keyword} (${market === "US" ? "미국 주식" : "국내 주식"}) · ${searchCandidates.length}개 후보 · 검색만 완료`;
   } catch (error) {
-    resultBody.innerHTML = '<tr><td colspan="3" class="empty">' + esc(error.message) + '</td></tr>';
+    resultBody.innerHTML = '<tr><td colspan="4" class="empty">' + esc(error.message) + '</td></tr>';
     $("#auto-discovery-search-summary").textContent = keyword + " · 조회 실패";
   } finally {
     autoDiscoverySearchBusy = false;
     button.disabled = false;
+    updateManualStartState();
   }
 });
 $("#auto-discovery-start").addEventListener("click", async () => {
@@ -237,13 +287,19 @@ $("#auto-discovery-start").addEventListener("click", async () => {
     if ($("#auto-discovery-market").value !== "KR") {
       throw new Error("가용현금 비율 투자는 국내 주식에서 지원합니다.");
     }
-    if (!investmentPlannerReady) throw new Error("AI 자동 배분을 사용하려면 서버 .env의 OpenAI 설정을 확인하고 서버를 다시 시작하세요.");
+    if (!searchedSector || searchedSector.keyword !== $("#auto-discovery-keyword").value.trim()
+        || searchedSector.market !== $("#auto-discovery-market").value) {
+      throw new Error("현재 섹터를 검색한 뒤 자동매매할 종목을 선택하세요.");
+    }
+    if (!chosenSymbols.size) throw new Error("자동매매할 종목을 하나 이상 선택하세요.");
+    if (!marketDataReady) throw new Error("토스 시세 연동을 설정해야 자동매매를 시작할 수 있습니다.");
     const result = await api("/api/v1/auto-discovery/start", {
       method: "POST",
       body: JSON.stringify({
         keyword: $("#auto-discovery-keyword").value.trim(),
         market: $("#auto-discovery-market").value,
-        cash_percentage: percentage
+        cash_percentage: percentage,
+        chosen_symbols: [...chosenSymbols]
       })
     });
     if (autoDiscoveryDraftRevision === draftRevision) autoDiscoveryDraft = false;
