@@ -1,3 +1,4 @@
+/* 공통 색상과 기본 글꼴: 밝은 화면을 기준으로, 아래 다크 모드에서 색상만 교체합니다. */
 :root {
   color-scheme: light;
   --canvas: #f5f5f7;
@@ -21,6 +22,7 @@
   text-rendering: optimizeLegibility;
 }
 
+/* 기본 요소와 페이지 배경 */
 * { box-sizing: border-box; }
 
 html { background: var(--canvas); }
@@ -37,61 +39,67 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-h1, h2, p { margin: 0; }
+h1, h2, h3, p { margin: 0; }
 h1 { margin-top: 17px; font-size: clamp(30px, 4vw, 52px); font-weight: 700; letter-spacing: -.045em; line-height: 1.04; }
-h2 { font-size: 20px; font-weight: 650; letter-spacing: -.025em; line-height: 1.2; }
+h2 { font-size: 22px; font-weight: 650; letter-spacing: -.025em; line-height: 1.2; }
+.topbar h3 { margin-top: 4px; font-size: 18px; line-height: 1.2; }
 
+/* 상단 제목·시세 연결 상태: 계좌 요약에 더 많은 세로 공간을 남기도록 압축합니다. */
 .topbar {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   gap: 28px;
-  max-width: 1380px;
+  max-width: 1480px;
   margin: 0 auto;
-  padding: 42px 34px 30px;
+  padding: 14px 34px 12px;
 }
 
 .brand-row { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
 .brand-mark { display: inline-grid; width: 24px; height: 24px; place-items: center; border-radius: 8px; color: white; background: linear-gradient(145deg, #65b8ff, #0071e3); box-shadow: 0 3px 9px rgba(0, 113, 227, .27); font-size: 16px; font-weight: 700; }
 .brand-name { color: var(--ink); }
 .mode-pill { margin-left: 3px; padding: 4px 8px; border-radius: 999px; color: var(--blue); background: var(--blue-soft); font-size: 10px; letter-spacing: .07em; }
-.subtitle { margin-top: 12px; color: var(--muted); font-size: 15px; letter-spacing: -.02em; }
+.subtitle { margin-top: 3px; color: var(--muted); font-size: 11px; letter-spacing: -.02em; }
 .top-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; min-width: 0; }
 .top-actions { display: flex; align-items: center; gap: 14px; padding-top: 2px; color: var(--muted); }
 .last-refreshed { color: var(--muted); font-size: 11px; line-height: 1.5; text-align: right; font-variant-numeric: tabular-nums; }
 .docs-link { color: var(--blue); font-size: 13px; font-weight: 600; text-decoration: none; }
 .docs-link span { margin-left: 3px; font-size: 15px; }
 
-.page { max-width: 1380px; margin: 0 auto; padding: 0 34px 58px; }
+/* 본문 폭과 작업 결과 알림 */
+.page { max-width: 1480px; margin: 0 auto; padding: 0 34px 12px; }
 .notice { min-height: 44px; display: flex; align-items: center; margin: 0 0 18px; padding: 12px 16px; border: 1px solid var(--line-soft); border-radius: 14px; color: var(--muted); background: rgba(255, 255, 255, .66); box-shadow: 0 3px 14px rgba(0, 0, 0, .03); font-size: 13px; }
 .notice.error { border-color: rgba(215, 0, 21, .18); color: var(--red); background: var(--red-soft); }
 .notice[hidden] { display: none; }
 
-.account-overview { margin-bottom: 15px; }
+/* 계좌 요약 카드: 큰 화면에서는 네 개를 한 줄에 표시합니다. */
+.account-overview { margin-bottom: 8px; }
 .account-overview > * { min-width: 0; }
-.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 15px; }
-.dashboard-panel-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 12px; }
-.dashboard-panel-nav a, .panel-back-link { display: inline-flex; align-items: center; min-height: 34px; border: 1px solid var(--line); border-radius: 999px; padding: 7px 13px; color: var(--blue); background: var(--surface-solid); font-size: 12px; font-weight: 650; text-decoration: none; }
+.kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+/* 자동매매 ↔ 투자 현황 가로 이동: 이 탐색 영역에서만 세로 휠을 화면 전환에 사용합니다. */
+.dashboard-panel-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 7px; padding: 4px 8px; border: 1px solid var(--line-soft); border-radius: 12px; background: var(--surface); }
+.dashboard-panel-nav a, .panel-back-link { display: inline-flex; align-items: center; min-height: 32px; border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; color: var(--blue); background: var(--surface-solid); font-size: 12px; font-weight: 650; text-decoration: none; }
 .dashboard-panel-nav a:hover, .dashboard-panel-nav a:focus-visible, .panel-back-link:hover, .panel-back-link:focus-visible { background: var(--blue-soft); }
 .dashboard-panel-nav > span:last-child { margin-left: auto; color: var(--muted); font-size: 12px; }
 .dashboard-panels { display: flex; align-items: flex-start; gap: 15px; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scroll-behavior: smooth; scrollbar-width: thin; scrollbar-color: var(--line) transparent; padding-bottom: 12px; }
 .dashboard-panels:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .dashboard-panels > .card { flex: 0 0 100%; min-width: 0; margin-bottom: 0; scroll-snap-align: start; }
-.dashboard-panel-bottom-link { display: flex; justify-content: flex-end; margin-top: 18px; }
+.dashboard-panel-bottom-link { display: flex; justify-content: flex-end; margin-top: 8px; }
 .investment-heading-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* 공통 카드와 작은 계좌 요약 수치 */
 .card { border: 1px solid var(--line-soft); border-radius: 20px; background: var(--surface); box-shadow: 0 8px 24px rgba(0, 0, 0, .045), 0 1px 2px rgba(0, 0, 0, .035); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
-.kpi { min-height: 145px; display: flex; flex-direction: column; justify-content: space-between; padding: 21px 22px 19px; }
+.kpi { min-height: 100px; display: flex; flex-direction: column; justify-content: space-between; padding: 11px 16px; border-radius: 15px; }
 .kpi span, .kpi small { color: var(--muted); }
-.kpi span { font-size: 13px; font-weight: 600; }
-.kpi strong { margin-top: 11px; color: var(--ink); font-size: clamp(23px, 2.4vw, 32px); font-weight: 650; letter-spacing: -.055em; line-height: 1; overflow-wrap: anywhere; }
-.kpi small { margin-top: 12px; font-size: 12px; }
-.pnl-comparison { display: grid; gap: 10px; margin: 12px 0 0; }
+.kpi span { font-size: 12px; font-weight: 600; }
+.kpi strong { margin-top: 4px; color: var(--ink); font-size: clamp(22px, 2vw, 28px); font-weight: 650; letter-spacing: -.055em; line-height: 1; overflow-wrap: anywhere; }
+.kpi small { margin-top: 3px; font-size: 11px; }
+.pnl-comparison { display: grid; gap: 3px; margin: 3px 0 0; }
 .pnl-comparison > div { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 10px; }
-.pnl-comparison dt { color: var(--muted); font-size: 12px; }
-.pnl-comparison dd { margin: 0; font-size: clamp(18px, 2vw, 24px); font-weight: 650; letter-spacing: -.04em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.pnl-comparison dt { color: var(--muted); font-size: 11px; }
+.pnl-comparison dd { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.04em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 
 .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-bottom: 19px; }
-.eyebrow { margin-bottom: 8px; color: var(--blue); font-size: 10px; font-weight: 700; letter-spacing: .105em; }
+.eyebrow { margin-bottom: 8px; color: var(--blue); font-size: 11px; font-weight: 700; letter-spacing: .105em; }
 .form-help, footer { color: var(--muted); }
 .button { min-height: 38px; border: 0; border-radius: 999px; padding: 9px 16px; color: var(--ink); background: var(--surface-soft); box-shadow: inset 0 0 0 1px var(--line-soft), 0 2px 4px rgba(0, 0, 0, .04); font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; transition: transform .18s ease, box-shadow .18s ease, filter .18s ease; }
 .button:hover { transform: translateY(-1px); box-shadow: inset 0 0 0 1px var(--line-soft), 0 5px 12px rgba(0, 0, 0, .1); filter: brightness(1.015); }
@@ -100,21 +108,42 @@ h2 { font-size: 20px; font-weight: 650; letter-spacing: -.025em; line-height: 1.
 .button.warning { color: var(--orange); background: var(--orange-soft); }
 .button.ghost { color: var(--blue); background: var(--surface-solid); }
 
+/* 검색·설정 폼의 공통 입력 스타일 */
 label { display: grid; gap: 7px; color: var(--muted); font-size: 12px; font-weight: 600; }
 input, select { width: 100%; min-height: 39px; border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; color: var(--ink); outline: 0; background: rgba(246, 246, 248, .9); font: inherit; font-size: 13px; transition: border-color .18s, box-shadow .18s, background .18s; }
 input:hover, select:hover { background: #fff; }
 input:focus, select:focus { border-color: rgba(0, 113, 227, .55); background: #fff; box-shadow: 0 0 0 4px rgba(0, 113, 227, .12); }
-.auto-discovery-card { padding: 22px; margin-bottom: 15px; }
-.auto-discovery-help { margin: -7px 0 18px; }
-.auto-discovery-form { display: grid; grid-template-columns: minmax(180px, 1.4fr) minmax(110px, .8fr) minmax(145px, 1fr); gap: 14px; align-items: end; }
-.auto-discovery-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 9px; }
+/* 자동매매 카드: 왼쪽은 검색·설정, 오른쪽은 운영 상태·종목 결과입니다. */
+/* 카드 높이는 화면에 맞춰 늘리고, 큰 화면에서는 최대 600px까지 최소 높이를 확보합니다. */
+.auto-discovery-card { min-height: clamp(440px, calc(100dvh - 330px), 600px); padding: 20px 24px; margin-bottom: 15px; }
+.auto-discovery-card .section-heading { margin-bottom: 10px; }
+.auto-discovery-help { margin: 0 0 14px; }
+.auto-discovery-card .form-help { font-size: 13px; line-height: 1.5; }
+.auto-discovery-columns { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); align-items: start; gap: 24px; }
+.auto-discovery-controls, .auto-discovery-details { min-width: 0; }
+/* 결과가 아주 많을 때만 오른쪽 칸을 스크롤하여 페이지 전체 높이를 유지합니다. */
+.auto-discovery-details { max-height: calc(100dvh - 420px); overflow-y: auto; scrollbar-width: thin; }
+.auto-discovery-form { display: grid; grid-template-columns: minmax(150px, 1.4fr) minmax(90px, .8fr) minmax(125px, 1fr); gap: 10px; align-items: end; }
+.auto-discovery-form label { gap: 6px; font-size: 13px; }
+.auto-discovery-form input, .auto-discovery-form select { min-height: 40px; padding: 8px 10px; font-size: 14px; }
+.auto-discovery-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.auto-discovery-actions .button { min-height: 38px; padding: 8px 13px; font-size: 13px; }
+.auto-discovery-controls > .form-help { margin-top: 9px; }
+.auto-discovery-guide { margin-top: 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.auto-discovery-guide summary { width: fit-content; color: var(--blue); cursor: pointer; }
+.auto-discovery-guide p { margin-top: 7px; }
 .allocation-preview[hidden] { display: none; }
-.allocation-preview { margin-top: 18px; padding-top: 4px; border-top: 1px solid var(--line-soft); }
+.allocation-preview { margin-top: 8px; padding-top: 4px; border-top: 1px solid var(--line-soft); }
+/* 보통의 선정 종목 다섯 개는 표 안쪽 스크롤 없이 모두 보이도록 합니다. */
+.auto-discovery-details .table-wrap { max-height: 320px; overflow: auto; }
+.auto-discovery-card th, .auto-discovery-card td { padding: 9px 7px; font-size: 13px; }
 .allocation-table { min-width: 560px; }
+.allocation-table td { padding-top: 8px; padding-bottom: 8px; }
+.allocation-table .volume-symbol { display: inline; margin: 0 0 0 6px; font-size: 11px; }
 .allocation-table th:not(:first-child), .allocation-table td:not(:first-child) { text-align: right; }
 .allocation-table td { font-variant-numeric: tabular-nums; }
 .auto-discovery-actions button:disabled { opacity: .55; cursor: not-allowed; }
-.auto-discovery-summary { margin: 16px 0 0; padding: 12px 14px; border-radius: 12px; background: var(--surface-soft); color: var(--muted); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.auto-discovery-summary { margin: 0; padding: 10px 12px; border-radius: 10px; background: var(--surface-soft); color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .auto-discovery-summary.error { color: var(--red); background: var(--red-soft); }
 .form-help { margin-top: 14px; font-size: 12px; line-height: 1.5; }
 
@@ -124,6 +153,7 @@ input:focus, select:focus { border-color: rgba(0, 113, 227, .55); background: #f
 .badge::before { width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: currentColor; content: ""; }
 .badge.muted { color: var(--muted); background: var(--surface-soft); }
 
+/* 시세·배분 표: 좁은 폭에서만 표 자체를 가로로 스크롤합니다. */
 .table-wrap { overflow-x: auto; }
 table { width: 100%; min-width: 420px; border-collapse: collapse; }
 th, td { padding: 12px 8px; border-bottom: 1px solid var(--line-soft); text-align: left; white-space: nowrap; }
@@ -135,13 +165,16 @@ tr:last-child td { border-bottom: 0; }
 .volume-symbol { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
 .positive { color: var(--red); }
 .negative { color: #0071e3; }
-.sector-search-preview { margin: 16px 0; padding: 12px 0; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
-.sector-keywords { display: flex; flex-wrap: wrap; gap: 7px; margin: 14px 0; }
-.sector-keywords button { border: 1px solid var(--line); border-radius: 999px; padding: 7px 11px; background: var(--surface-solid); color: var(--blue); font: inherit; font-size: 12px; cursor: pointer; }
+/* 섹터 후보 목록과 선택 체크박스 */
+.sector-search-preview { margin: 8px 0; padding: 5px 0; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
+.auto-discovery-details .form-help { margin-top: 7px; font-size: 13px; }
+.sector-keywords { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+.sector-keywords button { min-height: 32px; border: 1px solid var(--line); border-radius: 999px; padding: 6px 10px; background: var(--surface-solid); color: var(--blue); font: inherit; font-size: 13px; cursor: pointer; }
 .sector-keywords button:hover, .sector-keywords button:focus-visible { background: var(--blue-soft); }
 .sector-search-preview[hidden] { display: none; }
 .sector-select-input { width: 18px; height: 18px; min-height: 0; accent-color: var(--blue); cursor: pointer; }
-.investment-card { padding: 20px 22px; margin-bottom: 15px; }
+/* 오른쪽 투자 현황 패널: 원형 그래프, 범례, 종목별 툴팁 */
+.investment-card { min-height: clamp(440px, calc(100dvh - 330px), 600px); padding: 20px 24px; margin-bottom: 15px; }
 .investment-card .section-heading { margin-bottom: 8px; }
 .investment-stage { position: relative; display: grid; grid-template-columns: minmax(240px, 360px) minmax(0, 1fr); align-items: center; gap: 40px; max-width: 960px; margin: 0 auto; }
 .investment-donut { position: relative; width: min(100%, 340px); aspect-ratio: 1; justify-self: center; }
@@ -176,18 +209,40 @@ tr:last-child td { border-bottom: 0; }
 .investment-tooltip dt { color: var(--muted); flex-shrink: 0; }
 .investment-tooltip dd { margin: 0; font-weight: 650; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .investment-tooltip p { border-top: 1px solid var(--line-soft); padding-top: 10px; font-size: 11px; color: var(--muted); }
-footer { max-width: 1380px; margin: 0 auto; padding: 0 34px 35px; font-size: 12px; }
+footer { max-width: 1480px; margin: 0 auto; padding: 0 34px 10px; font-size: 11px; }
 
+/* 태블릿 이하에서는 자동매매의 좌우 칸을 세로로 쌓습니다. */
+@media (max-width: 1180px) {
+  .auto-discovery-columns { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .auto-discovery-details { max-height: none; overflow-y: visible; }
+}
+
+/* 작은 태블릿: 계좌 카드 두 열, 설정 폼 두 열 */
 @media (max-width: 900px) {
   .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .auto-discovery-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
+/* 높이가 낮은 데스크톱에서도 불필요한 페이지 하단 여백으로 스크롤이 생기지 않게 합니다. */
+@media (max-height: 870px) and (min-width: 1181px) {
+  .page, footer { padding-bottom: 0; }
+  /* 높이가 낮으면 여백과 글자 확대 폭을 줄여 한 화면 구성을 유지합니다. */
+  .auto-discovery-card, .investment-card { min-height: 0; padding: 16px 20px; }
+  .auto-discovery-details { max-height: calc(100dvh - 440px); }
+  .investment-donut { width: min(100%, clamp(220px, calc(100dvh - 460px), 330px)); }
+  .auto-discovery-card .form-help, .auto-discovery-details .form-help, .auto-discovery-summary, .auto-discovery-guide { font-size: 12px; }
+  .auto-discovery-form label, .auto-discovery-actions .button, .sector-keywords button { font-size: 12px; }
+  .auto-discovery-form input, .auto-discovery-form select { min-height: 36px; font-size: 13px; }
+  .auto-discovery-card th, .auto-discovery-card td { padding: 6px; font-size: 12px; }
+  .auto-discovery-card .dashboard-panel-bottom-link { display: none; }
+}
+
+/* 휴대폰: 계좌 카드와 차트는 읽기 편한 단일 열로 전환합니다. */
 @media (max-width: 620px) {
   .topbar { flex-direction: column; padding: 29px 18px 23px; }
   .top-actions { width: 100%; justify-content: space-between; }
   .top-meta { width: 100%; }
-  .page { padding: 0 18px 42px; }
+  .page { padding: 0 18px 24px; }
   .dashboard-panel-nav > span:last-child { flex-basis: 100%; margin-left: 0; }
   footer { padding: 0 18px 28px; }
   .kpi-grid { gap: 10px; }
@@ -195,17 +250,19 @@ footer { max-width: 1380px; margin: 0 auto; padding: 0 34px 35px; font-size: 12p
   .investment-donut { width: min(100%, 300px); }
   .investment-legend-item { gap: 9px; padding: 13px 0; }
   .investment-legend-empty { text-align: center; }
-  .kpi { min-height: 120px; padding: 16px; border-radius: 17px; }
-  .kpi strong { font-size: 23px; }
+  .kpi { min-height: 104px; padding: 12px; border-radius: 17px; }
+  .kpi strong { font-size: 21px; }
   .auto-discovery-form { grid-template-columns: 1fr; }
   .section-heading { align-items: flex-start; flex-direction: column; gap: 9px; }
   .investment-card, .auto-discovery-card { padding: 18px; border-radius: 17px; }
 }
 
+/* 애니메이션 축소를 설정한 사용자는 화면 전환을 즉시 처리합니다. */
 @media (prefers-reduced-motion: reduce) {
   .dashboard-panels { scroll-behavior: auto; }
 }
 
+/* 시스템 다크 모드의 표면·텍스트·입력창 색상 */
 @media (prefers-color-scheme: dark) {
   :root { color-scheme: dark; --canvas: #1d1d1f; --surface: rgba(44, 44, 46, .86); --surface-solid: #2c2c2e; --surface-soft: #3a3a3c; --line: rgba(235, 235, 245, .18); --line-soft: rgba(235, 235, 245, .1); --ink: #f5f5f7; --muted: #a1a1a6; --blue-soft: #173b63; --green-soft: #183d27; --orange-soft: #4a3018; --red-soft: #4b1c22; }
   body { background: radial-gradient(circle at 14% -10%, rgba(0, 113, 227, .3), transparent 31rem), var(--canvas); }

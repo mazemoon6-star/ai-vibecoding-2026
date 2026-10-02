@@ -17,6 +17,9 @@ class Element {
     this.listeners = {};
     this.hidden = false;
     this.disabled = false;
+    this.scrollLeft = 0;
+    this.scrollWidth = 0;
+    this.clientWidth = 0;
     this.classList = { toggle() {}, add() {}, remove() {} };
   }
   addEventListener(name, callback) {
@@ -31,6 +34,7 @@ class Element {
   appendChild() {}
   setAttribute() {}
   focus() {}
+  scrollTo({ left }) { this.scrollLeft = left; }
   querySelector() { return new Element(); }
 }
 
@@ -286,4 +290,30 @@ test("investment status is a right-hand scroll panel with navigation links", () 
   assert.match(html, /href="#auto-discovery-card"/);
   assert.match(css, /\.dashboard-panels\s*\{[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*scroll-snap-type:\s*x mandatory;/);
   assert.match(css, /\.dashboard-panels > \.card\s*\{[^}]*flex:\s*0 0 100%;[^}]*scroll-snap-align:\s*start;/);
+});
+
+test("mouse wheel on panel navigation switches screens without trapping vertical page scrolling", async () => {
+  const { find } = await fixture();
+  const panels = find("#dashboard-panels");
+  const nav = find("#dashboard-panel-nav");
+  panels.clientWidth = 1000;
+  panels.scrollWidth = 2015;
+
+  const down = await nav.emit("wheel", { deltaY: 120, deltaX: 0 });
+  assert.equal(down.prevented, true);
+  assert.equal(panels.scrollLeft, 1015);
+
+  const downAtEnd = await nav.emit("wheel", { deltaY: 120, deltaX: 0 });
+  assert.equal(downAtEnd.prevented, undefined);
+
+  const up = await nav.emit("wheel", { deltaY: -120, deltaX: 0 });
+  assert.equal(up.prevented, true);
+  assert.equal(panels.scrollLeft, 0);
+
+  const upAtStart = await nav.emit("wheel", { deltaY: -120, deltaX: 0 });
+  assert.equal(upAtStart.prevented, undefined);
+  const zoom = await nav.emit("wheel", { deltaY: 120, deltaX: 0, ctrlKey: true });
+  assert.equal(zoom.prevented, undefined);
+  assert.equal(panels.scrollLeft, 0);
+  assert.equal(panels.listeners.wheel, undefined);
 });

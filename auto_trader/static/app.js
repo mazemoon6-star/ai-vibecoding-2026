@@ -12,6 +12,16 @@ let searchedSector = null;
 let searchCandidates = [];
 const chosenSymbols = new Set();
 const investmentChart = new InvestmentChart($("#investment-card"));
+const dashboardPanels = $("#dashboard-panels");
+
+$("#dashboard-panel-nav").addEventListener("wheel", (event) => {
+  if (event.ctrlKey || Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+  const maxScroll = Math.max(0, dashboardPanels.scrollWidth - dashboardPanels.clientWidth);
+  const destination = event.deltaY > 0 ? maxScroll : 0;
+  if (maxScroll === 0 || Math.abs(dashboardPanels.scrollLeft - destination) < 2) return;
+  event.preventDefault();
+  dashboardPanels.scrollTo({ left: destination });
+}, { passive: false });
 
 function esc(value) {
   return String(value ?? "-").replace(/[&<>'"]/g, (char) => ({
